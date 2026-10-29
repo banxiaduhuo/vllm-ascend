@@ -33,7 +33,17 @@ from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
-from xlite._C import AttnDSA, AttnMeta, AttnMHA, AttnMLA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
+from xlite._C import (
+    AttnDSA,
+    AttnHybridGdn,
+    AttnMeta,
+    AttnMetaV2,
+    AttnMHA,
+    AttnMLA,
+    Runtime,
+    ScoringFuncSigmoid,
+    ScoringFuncSoftmax,
+)
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -44,6 +54,7 @@ from vllm_ascend.xlite.utils import (
     WeightGetterConfig,
     XModel,
     XModelConfig,
+    _TensorRepr,
     get_dotted_attr,
     get_layer_weights,
     set_dummy_tensor,
@@ -56,6 +67,12 @@ if TYPE_CHECKING:
     XliteModelRunner: TypeAlias = XliteModelRunnerV1 | XliteModelRunnerV2
 
 XliteForwardResult: TypeAlias = torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]
+
+
+def _to_int32(t: torch.Tensor) -> torch.Tensor:
+    """Cast a device tensor to contiguous int32 (the C++ aliases device tensors zero-copy as int32)."""
+    return t.to(torch.int32).contiguous()
+
 
 _architecture_strategy_map: dict[str, type[XliteModelBase]] = {}
 """Mapping from model architecture names in `config.json` to their corresponding xlite adapter classes."""
@@ -86,6 +103,10 @@ class XliteModelBase(ABC):
     _attn_metadata_type: type | tuple[type, ...] = AscendMetadata
     """The expected type of attention metadata in the forward context for this architecture. Used for runtime checks
     before forwarding. See :meth:`XliteWrapper.__call__` for usage."""
+    _attn_meta_version: int = 1
+    """The AttnMeta contract version this adapter forwards with: ``1`` = legacy :class:`AttnMeta` host-list path,
+    ``2`` = :class:`AttnMetaV2` device-tensor path (``forward_v2``), required when a single legacy metadata cannot
+    carry all cache families (e.g. GLM-5.3 kpool). See :meth:`XliteWrapper.__call__`."""
     _supported_architectures: Sequence[str] | str
     """The list of model architecture names (from HuggingFace `config.json` "architectures" field) supported by this
     adapter. Used for automatic adapter selection and registration."""
@@ -336,6 +357,33 @@ class StandardXliteModel(XliteModelBase):
         "Qwen3VLForConditionalGeneration",
     ]
 
+    def _pin_cache_geometry(self, backends: Sequence[type]) -> int:
+        """Pin kernel page geometry before Model.init() copies the config.
+
+        ``cache_config.block_size`` is only final after the platform's
+        update_block_size_for_backend() — executor init runs it, but its
+        hybrid/dtype alignment phases may still move it past any earlier
+        snapshot, so re-run it here and pick the kernel page every backend
+        in ``backends`` supports as a factor of the manager page. Rounding
+        max_seq_len up to whole manager pages keeps the native block-table
+        rows page-complete; the planner then budgets the final page's unused
+        columns while vLLM keeps its requested model-length limit.
+
+        Returns:
+            int: the kernel block size, so subclasses can assemble family
+            ``block_sizes`` vectors (e.g. GLM5's [main, pooled, tail-ring]).
+        """
+        from vllm.platforms import current_platform
+        from vllm.utils.math_utils import cdiv
+        from vllm.v1.worker.utils import select_common_block_size
+
+        current_platform.update_block_size_for_backend(self.vllm_config)
+        manager_block_size = self.vllm_config.cache_config.block_size
+        kernel_block_size = select_common_block_size(manager_block_size, backends)
+        self.xlite_config.block_size = kernel_block_size
+        self.xlite_config.max_seq_len = cdiv(self.xlite_config.max_seq_len, manager_block_size) * manager_block_size
+        return kernel_block_size
+
     def _build_model_config(self) -> None:
         xlite_config, vllm_config, hf_config = self.xlite_config, self.vllm_config, self.hf_text_config
 
@@ -481,8 +529,12 @@ class StandardXliteModel(XliteModelBase):
             setattr(xlite_model, xlite_attr, get_layer_weights(layers, layer_attr, mask=mask))
 
         wt_kwargs: WeightGetterConfig = {"mask": mask, "post_processor": self._transform_deq_scale}
-        deq_scale = get_layer_weights(layers, f"{model_prefix}.deq_scale", **wt_kwargs)
-        if len(deq_scale) > 0:  # static quant
+        # A masked probe is polluted by dummy placeholders for missing attrs (they are
+        # rebindable non-empty tensors), which would misclassify dynamic-quant
+        # checkpoints as static. Probe unmasked first: missing attrs filter out to an
+        # empty list, so a non-empty result is a reliable static-quant signal.
+        if len(get_layer_weights(layers, f"{model_prefix}.deq_scale")) > 0:  # static quant
+            deq_scale = get_layer_weights(layers, f"{model_prefix}.deq_scale", **wt_kwargs)
             setattr(xlite_model, f"{xlite_prefix}_deq_scale", deq_scale)
             set_xlite_attr(f"{xlite_prefix}_input_scale", f"{model_prefix}.aclnn_input_scale_reciprocal")
             set_xlite_attr(f"{xlite_prefix}_input_offset", f"{model_prefix}.aclnn_input_offset")
@@ -536,6 +588,346 @@ class Glm4MoeXliteModel(StandardXliteModel):
         xlite_config.norm_topk_prob = hf_config.norm_topk_prob
         xlite_config.scoring_func = ScoringFuncSigmoid
         xlite_config.route_scale = hf_config.routed_scaling_factor
+
+
+class Qwen35XliteModel(StandardXliteModel):
+    """xlite adapter for Qwen3.5: hybrid GatedDeltaNet (KDA) linear attention + GQA full attention.
+
+    Binds the vLLM-sharded weights to the xlite layouts: Gemma-style RMSNorm ``x * (1 + w)`` is
+    converted to the standard ``x * w`` (:meth:`_gemma_norm`); the full-attention ``qkv_proj``
+    rows ``[q|gate interleaved, k, v]`` are repacked to ``[Q|K|V|Gate]`` (``attn_output_gate``);
+    the fused GDN ``in_proj_qkvz``/``in_proj_ba`` rows ``[q|k|v|z]``/``[b|a]`` are split into the
+    C++ ``linear_in_proj_qkv/z/b/a`` slots.
+
+    Metadata is assembled into :class:`AttnMetaV2` with ``block_tables = [main paged KV, mamba
+    state indices]`` and a single main ``slot_mapping``.
+    """
+
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    _attn_metadata_type = (XliteModelBase._attn_metadata_type, GDNAttentionMetadata)
+    _attn_meta_version = 2
+    # "Qwen3_5*ForConditionalGeneration": the open-weight checkpoints are the VLM-wrapped
+    # architectures (text_config + vision tower); text layers resolve via the shared
+    # language_model.* prefix path and the ViT stays on the native inputs_embeds route.
+    _supported_architectures = [
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    ]
+
+    def _build_model_config(self) -> None:
+        # Qwen3.5 MoE text configs carry only moe_intermediate_size (no dense FFN field); fill
+        # the slot before the base builder reads it -- unused when first_k_dense_replace == 0,
+        # i.e. every layer routes through the experts.
+        if not hasattr(self.hf_text_config, "intermediate_size"):
+            self.hf_text_config.intermediate_size = self.hf_text_config.moe_intermediate_size
+        super()._build_model_config()
+        xlite_config, hf_config = self.xlite_config, self.hf_text_config
+
+        # Hybrid dispatch (KDA linear attention + GQA full attention).
+        xlite_config.attn_type = AttnHybridGdn
+        xlite_config.full_attention_interval = getattr(hf_config, "full_attention_interval", 4)
+        xlite_config.linear_num_k_heads = hf_config.linear_num_key_heads
+        xlite_config.linear_num_v_heads = hf_config.linear_num_value_heads
+        xlite_config.linear_key_head_dim = hf_config.linear_key_head_dim
+        xlite_config.linear_value_head_dim = hf_config.linear_value_head_dim
+        xlite_config.linear_conv_kernel_dim = hf_config.linear_conv_kernel_dim
+        xlite_config.qk_norm = True
+        xlite_config.attn_output_gate = True
+        # qkv bias follows the actual weights (the vllm Qwen3Next qkv_proj is built with bias=False).
+        xlite_config.qkv_bias = False
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+
+        xlite_config.block_sizes = [self._pin_cache_geometry([AscendAttentionBackend])]
+
+        # MoE (Qwen3_5MoeForCausalLM only; the dense model keeps the Standard all-dense defaults).
+        if getattr(hf_config, "num_experts", 0):
+            xlite_config.n_dense_layers = getattr(hf_config, "first_k_dense_replace", 0)
+            xlite_config.n_routed_experts = hf_config.num_experts
+            xlite_config.n_act_experts = hf_config.num_experts_per_tok
+            xlite_config.moe_intermediate_size = hf_config.moe_intermediate_size
+            xlite_config.norm_topk_prob = getattr(hf_config, "norm_topk_prob", True)
+            xlite_config.scoring_func = ScoringFuncSoftmax
+            xlite_config.route_scale = 1.0
+
+    @staticmethod
+    def _gemma_norm(weight: torch.Tensor) -> torch.Tensor:
+        """Gemma RMSNorm ``x * (1 + w)`` -> standard RMSNorm ``x * w`` for the xlite kernels."""
+        return (weight.float() + 1.0).to(weight.dtype).contiguous()
+
+    def _get_rope(self, layer_idx: int = 0) -> AscendRotaryEmbedding | None:
+        """Probe the first full-attention layer for the rotary embedding (index 0 may be a KDA layer)."""
+        layers, _ = self._get_layers_and_model_prefix()
+        for i in range(len(layers)):
+            if (rope := get_dotted_attr(layers, f"{i}.self_attn.rotary_emb")) is not None:
+                return rope
+        logger.warning_once("xlite adapter: Rotary embedding not found in the model layers. RoPE will be disabled.")
+        return None
+
+    def _build_model(self) -> None:
+        # NOTE: does NOT call super()._build_model() — the per-layer slots split by attention type
+        # (packed mha_qkv vs the GDN linear-in-proj set) need the empty-placeholder layout the C++
+        # init skips placeholder entries on.
+        xlite_model, xlite_config = self.xlite_model, self.xlite_config
+        layers, model_prefix = self._get_layers_and_model_prefix()
+        hf_config = self.hf_text_config
+        n_layers = xlite_config.n_layers
+        tp_size = xlite_config.def_tp_size
+
+        # embed / norm / head (all Qwen3.5 RMSNorms are Gemma-style).
+        xlite_model.embed = get_dotted_attr(self.npu_runnable, f"{model_prefix}model.embed_tokens.weight", raises=True)
+        xlite_model.norm = self._gemma_norm(
+            get_dotted_attr(self.npu_runnable, f"{model_prefix}model.norm.weight", raises=True)
+        )
+        if self.vllm_config.model_config.hf_config.tie_word_embeddings:
+            xlite_model.head = xlite_model.embed
+        else:
+            xlite_model.head = get_dotted_attr(self.npu_runnable, f"{model_prefix}lm_head.weight", raises=True)
+        xlite_model.attn_norm = [self._gemma_norm(w) for w in get_layer_weights(layers, "input_layernorm.weight")]
+        xlite_model.mlp_norm = [
+            self._gemma_norm(w) for w in get_layer_weights(layers, "post_attention_layernorm.weight")
+        ]
+
+        # Per-layer KDA vs full-attention dispatch from the runnable layer modules (authoritative;
+        # layer_type is set on every Qwen3_5DecoderLayer).
+        self.kda_layers = [
+            i for i, layer in enumerate(layers) if getattr(layer, "layer_type", "") == "linear_attention"
+        ]
+        kda_set = set(self.kda_layers)
+        self.full_attn_layers = [i for i in range(n_layers) if i not in kda_set]
+
+        # Full-attention local geometry (qkv_proj rows: [q|gate interleaved, k, v]).
+        n_heads_local = max(1, hf_config.num_attention_heads // tp_size)
+        n_kv_local = max(1, hf_config.num_key_value_heads // tp_size)
+        head_dim = xlite_config.head_dim
+        q_rows = n_heads_local * head_dim
+        kv_size = n_kv_local * head_dim
+        # KDA linear-attention local geometry (qkvz rows: [q|k|v|z] segments, ba rows: [b|a]).
+        k_dim = hf_config.linear_key_head_dim
+        v_dim = hf_config.linear_value_head_dim
+        n_k_local = max(1, hf_config.linear_num_key_heads // tp_size)
+        n_v_local = max(1, hf_config.linear_num_value_heads // tp_size)
+        kdl, vdl = n_k_local * k_dim, n_v_local * v_dim
+
+        attn_out: list[torch.Tensor] = []
+        mha_qkv: list[torch.Tensor] = []
+        mha_qkv_bias: list[torch.Tensor] = []
+        mha_q_norm: list[torch.Tensor] = []
+        mha_k_norm: list[torch.Tensor] = []
+        lip_qkv: list[torch.Tensor] = []
+        lip_z: list[torch.Tensor] = []
+        lip_b: list[torch.Tensor] = []
+        lip_a: list[torch.Tensor] = []
+        conv1d: list[torch.Tensor] = []
+        a_log: list[torch.Tensor] = []
+        dt_bias: list[torch.Tensor] = []
+        lin_norm: list[torch.Tensor] = []
+        out_proj: list[torch.Tensor] = []
+
+        for i, layer in enumerate(layers):
+            if i in kda_set:
+                la = layer.linear_attn
+                qkvz = la.in_proj_qkvz.weight
+                ba = la.in_proj_ba.weight
+                attn_out.append(_DUMMY_TENSOR)
+                mha_qkv.append(_DUMMY_TENSOR)
+                if xlite_config.qk_norm:
+                    mha_q_norm.append(_DUMMY_TENSOR)
+                    mha_k_norm.append(_DUMMY_TENSOR)
+                if xlite_config.qkv_bias:
+                    mha_qkv_bias.append(_DUMMY_TENSOR)
+                lip_qkv.append(qkvz[: 2 * kdl + vdl])
+                lip_z.append(qkvz[2 * kdl + vdl :])
+                lip_b.append(ba[:n_v_local])
+                lip_a.append(ba[n_v_local:])
+                conv1d.append(la.conv1d.weight)
+                a_log.append(la.A_log)
+                dt_bias.append(la.dt_bias)
+                lin_norm.append(la.norm.weight)  # KDA gated RMSNorm is standard x*w already
+                out_proj.append(la.out_proj.weight)
+            else:
+                attn = layer.self_attn
+                qkv = attn.qkv_proj.weight
+                q_gate, k_w, v_w = qkv.split([2 * q_rows, kv_size, kv_size], dim=0)
+                qg = q_gate.view(n_heads_local, 2, head_dim, -1)
+                # C++ mha_qkv layout: [Q|K|V|Gate].
+                mha_qkv.append(torch.cat([qg[:, 0].reshape(q_rows, -1), k_w, v_w, qg[:, 1].reshape(q_rows, -1)], dim=0))
+                if attn.qkv_proj.bias is not None:
+                    q_gate_b, k_b, v_b = attn.qkv_proj.bias.split([2 * q_rows, kv_size, kv_size], dim=0)
+                    bg = q_gate_b.view(n_heads_local, 2, head_dim)
+                    mha_qkv_bias.append(torch.cat([bg[:, 0].reshape(-1), k_b, v_b, bg[:, 1].reshape(-1)], dim=0))
+                attn_out.append(attn.o_proj.weight)
+                mha_q_norm.append(self._gemma_norm(attn.q_norm.weight))
+                mha_k_norm.append(self._gemma_norm(attn.k_norm.weight))
+                lip_qkv.append(_DUMMY_TENSOR)
+                lip_z.append(_DUMMY_TENSOR)
+                lip_b.append(_DUMMY_TENSOR)
+                lip_a.append(_DUMMY_TENSOR)
+                conv1d.append(_DUMMY_TENSOR)
+                a_log.append(_DUMMY_TENSOR)
+                dt_bias.append(_DUMMY_TENSOR)
+                lin_norm.append(_DUMMY_TENSOR)
+                out_proj.append(_DUMMY_TENSOR)
+
+        xlite_model.attn_out = attn_out
+        xlite_model.mha_qkv = mha_qkv
+        if mha_qkv_bias:
+            xlite_model.mha_qkv_bias = mha_qkv_bias
+            xlite_config.qkv_bias = True
+        if xlite_config.qk_norm:
+            xlite_model.mha_q_norm = mha_q_norm
+            xlite_model.mha_k_norm = mha_k_norm
+        xlite_model.linear_in_proj_qkv = lip_qkv
+        xlite_model.linear_in_proj_z = lip_z
+        xlite_model.linear_in_proj_b = lip_b
+        xlite_model.linear_in_proj_a = lip_a
+        xlite_model.linear_conv1d = conv1d
+        xlite_model.linear_a_log = a_log
+        xlite_model.linear_dt_bias = dt_bias
+        xlite_model.linear_norm = lin_norm
+        xlite_model.linear_out_proj = out_proj
+
+        # Dense MLP slots (MoE layers carry no mlp.gate_up_proj and are skipped by the getter).
+        self.init_matmul_weights(layers, "mlp_up_gate", "mlp.gate_up_proj")
+        self.init_matmul_weights(layers, "mlp_down", "mlp.down_proj")
+
+        # MoE slots (MoE layers only; FusedMoE stacks its local experts on dim 0).
+        moe_layers = [layer for layer in layers if getattr(layer.mlp, "experts", None) is not None]
+        if moe_layers:
+            xlite_model.gate = [layer.mlp.gate.weight for layer in moe_layers]
+            xlite_model.re_up_gate = [
+                w for layer in moe_layers for w in layer.mlp.experts.routed_experts.w13_weight.unbind(0)
+            ]
+            xlite_model.re_down = [
+                w for layer in moe_layers for w in layer.mlp.experts.routed_experts.w2_weight.unbind(0)
+            ]
+            xlite_config.gate_captured = self.is_tensor_nz(xlite_model.gate[0])
+            xlite_config.experts_weight_nz = self.is_tensor_nz(xlite_model.re_up_gate[0])
+            shared_experts = [
+                layer.mlp.shared_expert for layer in moe_layers if getattr(layer.mlp, "shared_expert", None) is not None
+            ]
+            if shared_experts:
+                xlite_model.se_up_gate = [s.gate_up_proj.weight for s in shared_experts]
+                xlite_model.se_down = [s.down_proj.weight for s in shared_experts]
+                xlite_model.se_gate = [layer.mlp.shared_expert_gate.weight for layer in moe_layers]
+                xlite_config.n_shared_experts = 1
+
+    def extract_kv_cache(self, kv_caches: list[torch.Tensor], /) -> list[tuple[torch.Tensor, ...]]:
+        """Split the flat cache list into per-layer family tuples.
+
+        Families are matched by (dtype, ndim) signatures — the fp32 KDA ssm state is the only
+        fp32 family; full-attention layers register one fused ``[2, ...]`` tensor (V1) or a pair
+        of adjacent 4D k/v views (V2/MRV2 regrouping). Pairing follows the deterministic
+        per-layer registration order; optional trailing MTP layers are dropped by the
+        per-family counts. KDA layers -> ``(conv, ssm)``; full-attention layers -> ``(k, v)``.
+        """
+        n_layers = self.xlite_config.n_layers
+        kda_set = set(self.kda_layers)
+        n_kda, n_full = len(kda_set), n_layers - len(kda_set)
+
+        fulls: list[torch.Tensor] = []
+        convs: list[torch.Tensor] = []
+        ssms: list[torch.Tensor] = []
+        for t in kv_caches:
+            if t.dtype == self.dtype:
+                if t.dim() == 5 and t.shape[0] == 2:
+                    fulls.append(t)  # V1 flat path: fused k/v
+                elif t.dim() == 4:
+                    fulls.append(t)  # V2/MRV2: per-layer k or v view of the fused parent
+                else:
+                    convs.append(t)  # KDA conv state (paged or slot-major)
+            else:
+                ssms.append(t)  # KDA recurrent state (fp32)
+        for fam, family_list, expected in (("full", fulls, n_full), ("conv", convs, n_kda), ("ssm", ssms, n_kda)):
+            if len(family_list) < expected:
+                raise ValueError(f"xlite qwen3.5: {fam} cache count mismatch ({len(family_list)} vs. {expected}).")
+
+        if fulls[0].dim() == 5:
+            full_views = [(t[0], t[1]) for t in fulls[:n_full]]
+        else:
+            if len(fulls) < 2 * n_full:
+                raise ValueError(f"xlite qwen3.5: full cache count mismatch ({len(fulls)} vs. {2 * n_full}).")
+            full_views = [(fulls[2 * j], fulls[2 * j + 1]) for j in range(n_full)]
+        full_caches = {layer: view for layer, view in zip(self.full_attn_layers, full_views)}
+        kda_caches = {layer: (conv, ssm) for layer, conv, ssm in zip(self.kda_layers, convs[:n_kda], ssms[:n_kda])}
+        result = [kda_caches[i] if i in kda_set else full_caches[i] for i in range(n_layers)]
+        logger.info_once("xlite qwen3.5: registered kv caches (flat): %s", _TensorRepr(result, max_it=None))
+        return result
+
+    def build_attn_meta_v2(self, attn_metadata: dict[str, Any], positions: torch.Tensor) -> tuple[Any, int]:
+        """Assemble the Qwen3.5 :class:`AttnMetaV2` with family-slot metadata.
+
+        Full attention (``AscendMetadata``) supplies lens/cached_lens/query_start_loc and the
+        shared paged KV block table. KDA (``GDNAttentionMetadata``) supplies
+        ``non_spec_state_indices_tensor`` (the mamba state indices, i.e. ``block_table[:, 0]``),
+        deduplicated into one ``[num_reqs, 1]`` entry per mamba cache group — block ids ARE the
+        state indices, mirroring the GLM5 family slot layout.
+
+        Returns:
+            tuple[Any, int]: ``(AttnMetaV2, num_actual_tokens)``; ``(None, 0)`` for an empty batch.
+        """
+        full_meta, _ = AttnMetadataRouter.pick(attn_metadata, self.AscendMetadata, self.GDNAttentionMetadata)
+        num_actual_tokens = int(full_meta.num_actual_tokens)
+        if num_actual_tokens == 0:
+            return None, 0  # empty batch: the wrapper skips the C++ forward
+
+        i32 = _to_int32
+
+        # AscendMetadata.query_start_loc is the 0-prefixed cumulative query boundary tensor.
+        query_start_loc = i32(full_meta.query_start_loc)
+        lens = i32(query_start_loc[1:] - query_start_loc[:-1])
+        num_reqs = lens.numel()
+        # MRV2 hosts seq_lens on CPU; prefer the persistent device-side mirror (seq_lens_gpu,
+        # int32, refreshed in place every step) so the clamp stays on NPU.
+        seq_lens = full_meta.seq_lens_gpu
+        if seq_lens is None:
+            seq_lens = full_meta.seq_lens.to(query_start_loc.device)
+        cached_lens = torch.clamp(i32(seq_lens[:num_reqs]) - lens, min=0)
+
+        # vLLM splits the KDA layers round-robin into mamba cache groups whose tensors alias
+        # the same regions from byte 0, so each group needs its own state indices: dedup the
+        # per-layer GDNAttentionMetadata into tables for blockTables[1..n] (C++ maps KDA
+        # position p to table 1 + p % n).
+        meta_by_layer = {
+            int(m.group(1)): v
+            for name, v in attn_metadata.items()
+            if isinstance(v, self.GDNAttentionMetadata) and (m := re.search(r"layers\.(\d+)\.", name))
+        }
+        tables: list[Any] = []
+        tid_by_meta: dict[int, int] = {}
+        of_layer: list[int] = []
+        for layer in self.kda_layers:
+            v = meta_by_layer[layer]
+            tid = tid_by_meta.get(id(v))
+            if tid is None:
+                tid = tid_by_meta[id(v)] = len(tables)
+                tables.append(v)
+            of_layer.append(tid)
+        kda_tables = [i32(v.non_spec_state_indices_tensor).reshape(-1, 1) for v in tables]
+        if any(t.shape[0] < num_reqs for t in kda_tables):
+            raise ValueError(f"xlite qwen3.5: request-count mismatch across metadata families (main={num_reqs}).")
+        if len(tables) > 1 and of_layer != [p % len(tables) for p in range(len(of_layer))]:
+            raise ValueError(
+                f"xlite qwen3.5: mamba group assignment {of_layer} is not the round-robin "
+                f"{[p % len(tables) for p in range(len(of_layer))]} the C++ mapping assumes."
+            )
+
+        pos: torch.Tensor = torch.atleast_2d(positions)[:, :num_actual_tokens].contiguous()
+
+        meta = AttnMetaV2()
+        meta.lens_cpu = lens.tolist()
+        meta.cached_lens_cpu = cached_lens.tolist()
+        meta.lens = lens
+        meta.cached_lens = cached_lens
+        meta.query_start_loc = query_start_loc
+        meta.positions = pos.reshape(-1).reshape(pos.shape)  # int64, rematerialized with correct stride
+        # Family slots: [0] main paged KV, [1..] KDA mamba state indices — one table per
+        # mamba cache group (see the per-group mapping above).
+        meta.block_tables = [i32(full_meta.block_tables[:num_reqs]), *kda_tables]
+        meta.slot_mapping = [i32(full_meta.slot_mapping)]
+        return meta, num_actual_tokens
 
 
 class DeepseekV3XliteModel(Glm4MoeXliteModel):
@@ -772,8 +1164,11 @@ class XliteWrapper:
     def __del__(self) -> None:
         self.npu_runner = None  # type: ignore[assignment]
         self.npu_runnable = None  # type: ignore[assignment]
-        self.adapter_xlite_model.npu_runner = None  # type: ignore[assignment]
-        self.adapter_xlite_model.xlite_model = None  # type: ignore[assignment]
+        # __init__ may have failed before the adapter was created; go through __dict__ so a
+        # half-constructed wrapper does not hit __getattr__ and mask the original error.
+        if (adapter := self.__dict__.get("adapter_xlite_model")) is not None:
+            adapter.npu_runner = None  # type: ignore[assignment]
+            adapter.xlite_model = None  # type: ignore[assignment]
 
     def __getattr__(self, key: str) -> Any:
         """Proxy unknown attributes to the wrapped runnable model.
@@ -825,7 +1220,11 @@ class XliteWrapper:
         forward_context = get_forward_context()
         attn_metadata: Any = forward_context.attn_metadata
         attn_metadata = attn_metadata[0] if isinstance(attn_metadata, list) else attn_metadata
-        attn_metadata = attn_metadata.get("model.layers.0.self_attn.attn", next(iter(attn_metadata.values()), None))
+        # V2 adapters (GLM5 kpool) build an AttnMetaV2 from the full per-layer metadata dict
+        # (type-driven pick below); V1 adapters reduce to a single metadata object first — the
+        # "layers.0" key is a KDA layer on GLM5, so the reduction must not happen there.
+        if getattr(self.adapter_xlite_model, "_attn_meta_version", 1) != 2:
+            attn_metadata = attn_metadata.get("model.layers.0.self_attn.attn", next(iter(attn_metadata.values()), None))
         # Since v0.28.0, batches are routed by token count (max across DP ranks) instead of the batch attention
         # state: batches within the preallocated budget run on xlite, others fall back to the native acl runnable.
         num_tokens: int
@@ -844,33 +1243,50 @@ class XliteWrapper:
                 )
             return self.npu_runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
 
-        attn_metadata_router = AttnMetadataRouter(attn_metadata=attn_metadata, device="cpu")
-        num_actual_tokens = attn_metadata_router.num_actual_tokens
-        seq_lens = attn_metadata_router.seq_lens
-        cum_query_lens = attn_metadata_router.cu_query_lens[-seq_lens.size(0) :]
-        query_lens = torch.diff(cum_query_lens, prepend=seq_lens.new_zeros(1))
-        cached_lens = torch.clamp(seq_lens - query_lens, min=0)
-        block_tables = attn_metadata_router.block_tables
-        num_reqs = max(1, (block_tables[:, 0] != 0).sum().item())  # number of non-empty requests
+        stream = torch.npu.current_stream().npu_stream
+        if getattr(self.adapter_xlite_model, "_attn_meta_version", 1) == 2:
+            attn_meta, num_actual_tokens = self.adapter_xlite_model.build_attn_meta_v2(attn_metadata, positions)
+            if attn_meta is None:
+                # Empty batch (async scheduling emits 0-token steps): skip the C++ forward entirely.
+                return self.hidden_states[:0]
+            forward, forward_with_inputs_embeds = (
+                self.xlite_model.forward_v2,
+                self.xlite_model.forward_with_inputs_embeds_v2,
+            )
+            # forward_v2 takes the RoPE cache as a tensor list (the V1 path takes the bare cache).
+            freqs_cis = [self.freq_cis]
+        else:
+            attn_metadata_router = AttnMetadataRouter(attn_metadata=attn_metadata, device="cpu")
+            num_actual_tokens = attn_metadata_router.num_actual_tokens
+            seq_lens = attn_metadata_router.seq_lens
+            cum_query_lens = attn_metadata_router.cu_query_lens[-seq_lens.size(0) :]
+            query_lens = torch.diff(cum_query_lens, prepend=seq_lens.new_zeros(1))
+            cached_lens = torch.clamp(seq_lens - query_lens, min=0)
+            block_tables = attn_metadata_router.block_tables
+            num_reqs = max(1, (block_tables[:, 0] != 0).sum().item())  # number of non-empty requests
 
-        xlite_attn_metadata = AttnMeta()
-        xlite_attn_metadata.lens = query_lens[:num_reqs].tolist()
-        xlite_attn_metadata.cached_lens = cached_lens[:num_reqs].tolist()
-        xlite_attn_metadata.block_tables_cpu = block_tables[:num_reqs].tolist()
-        pos: torch.Tensor = torch.atleast_2d(positions)[:, :num_actual_tokens].contiguous()
-        xlite_attn_metadata.positions = pos.reshape(-1).reshape(pos.shape)  # rematerialize with correct stride
+            attn_meta = AttnMeta()
+            attn_meta.lens = query_lens[:num_reqs].tolist()
+            attn_meta.cached_lens = cached_lens[:num_reqs].tolist()
+            attn_meta.block_tables_cpu = block_tables[:num_reqs].tolist()
+            pos: torch.Tensor = torch.atleast_2d(positions)[:, :num_actual_tokens].contiguous()
+            attn_meta.positions = pos.reshape(-1).reshape(pos.shape)  # rematerialize with correct stride
+            forward, forward_with_inputs_embeds = (
+                self.xlite_model.forward,
+                self.xlite_model.forward_with_inputs_embeds,
+            )
+            freqs_cis = self.freq_cis
 
         # under DP, `num_tokens` is the max number of tokens across all DP ranks for data alignment
         h = self.hidden_states[:num_tokens]
-        stream = torch.npu.current_stream().npu_stream
         input_ids = cast(torch.Tensor, input_ids)
         if inputs_embeds is None or inputs_embeds.size(0) == 0:
-            self.xlite_model.forward(
+            forward(
                 rt=self.xlite_rt,
                 input=input_ids[:num_actual_tokens],
-                attn_meta=xlite_attn_metadata,
+                attn_meta=attn_meta,
                 kv_cache=self.kv_caches,
-                freqs_cis=self.freq_cis,
+                freqs_cis=freqs_cis,
                 output=h,
                 curr_stream=stream,
             )
@@ -880,12 +1296,14 @@ class XliteWrapper:
             xlite_deepstack_input_embeds = [
                 deepstack_input[: inputs_embeds.size(0)] for deepstack_input in deepstack_input_embeds
             ]
-            self.xlite_model.forward_with_inputs_embeds(
+            forward_with_inputs_embeds(
                 rt=self.xlite_rt,
                 input=inputs_embeds,
-                attn_meta=xlite_attn_metadata,
+                attn_meta=attn_meta,
                 kv_cache=self.kv_caches,
-                freqs_cis=self.freq_cis,
+                # forward_with_inputs_embeds_v2 binds freqs_cis as a single tensor (unlike the
+                # tensor-list contract of forward_v2); the V1 path takes the bare cache too.
+                freqs_cis=freqs_cis[0] if isinstance(freqs_cis, list) else freqs_cis,
                 output=h,
                 curr_stream=stream,
                 deepstack_input=xlite_deepstack_input_embeds,

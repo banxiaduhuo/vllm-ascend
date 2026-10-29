@@ -318,6 +318,35 @@ class AttnMetadataRouter:
         finally:
             self.device = original_device
 
+    @classmethod
+    def pick(cls, attn_metadata: dict[str, Any], *types: type) -> tuple[Any, ...]:
+        """Select metadata objects by type from a per-layer metadata dict.
+
+        MRV2 builds ``dict[layer_name] -> metadata`` per attention group; the layer names and their
+        order differ across backends and configurations, while object types are stable. Selection is
+        therefore type-driven: for each requested type, the first value (in dict insertion order)
+        that is an instance of it is returned, so routing is independent of key names.
+
+        Args:
+            attn_metadata (dict[str, Any]): The per-layer attention metadata dict from the forward context.
+            *types (type): Metadata types to pick, in the desired return order.
+
+        Returns:
+            tuple[Any, ...]: Metadata objects aligned with ``types``.
+
+        Raises:
+            ValueError: If some requested type has no matching metadata object.
+        """
+        picked: list[Any] = []
+        for meta_type in types:
+            for meta in attn_metadata.values():
+                if isinstance(meta, meta_type):
+                    picked.append(meta)
+                    break
+            else:
+                raise ValueError(f"xlite: no attention metadata of type {meta_type.__name__} found for routing.")
+        return tuple(picked)
+
     def __getattr__(self, name: str) -> Any:
         """Route attribute access to the appropriate handler method based on the attribute name."""
         if (value := getattr(self.attn_metadata, name, _MISSING)) is not _MISSING:
