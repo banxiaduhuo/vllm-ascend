@@ -208,6 +208,10 @@ def initialize_kv_cache(
         for tensor in (cache if isinstance(cache, (tuple, list)) else (cache,))
         if tensor is not None and tensor.device == self.device
     ]
+    # Keep the name -> view mapping alongside the flat list above: layer-major adapters
+    # resolve per-layer ownership from the names (group-by-group flat order is a packing
+    # artifact, not identity).
+    self._kv_caches_dict = kv_caches_dict
     if is_profiling:
         self.kv_connector = upstream.NO_OP_KV_CONNECTOR
     else:
