@@ -168,6 +168,9 @@ class XliteModelRunnerV2(XliteModelRunnerMixin, NPUModelRunnerV2):  # type: igno
         super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context=kv_cache_allocation_context)
         kv_caches: list[torch.Tensor] = self._get_flattened_kv_caches(self.kv_caches, check_is_contiguous=False)
         logger.info_once("xlite: registering kv caches to runner model: %s", _TensorRepr(kv_caches, max_it=None))
+        # Expose vllm's own pool-ownership metadata (kv_cache_tensors[].layers) so GLM5 can pair
+        # the KDA conv/ssm pools by layer id instead of relying on the flat list order.
+        self.runner_model.adapter_xlite_model.kv_cache_config = kv_cache_config
         cache_dict = getattr(self, "_kv_caches_dict", None)
         if cache_dict is not None and getattr(self.runner_model.adapter_xlite_model, "_layer_major_kv_cache", False):
             self.runner_model.register_kv_caches(cache_dict)
