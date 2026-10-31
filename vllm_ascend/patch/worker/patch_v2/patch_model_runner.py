@@ -202,6 +202,9 @@ def initialize_kv_cache(
     register_sparse_kv_caches = getattr(self, "_register_sparse_kv_caches", None)
     if register_sparse_kv_caches is not None:
         register_sparse_kv_caches(kv_caches_dict)
+    # Keep the name -> view mapping so adapters that need per-layer ownership can
+    # resolve it without guessing from the group-by-group flat order.
+    self._kv_caches_dict = kv_caches_dict
     self.kv_caches = [
         tensor
         for cache in kv_caches_dict.values()

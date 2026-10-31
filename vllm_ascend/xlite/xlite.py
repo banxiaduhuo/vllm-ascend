@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
@@ -33,6 +34,7 @@ from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
+from vllm.v1.worker.utils import extract_layer_index
 from xlite._C import (
     AttnDSA,
     AttnHybridGdn,
@@ -68,6 +70,28 @@ if TYPE_CHECKING:
     XliteModelRunner: TypeAlias = XliteModelRunnerV1 | XliteModelRunnerV2
 
 XliteForwardResult: TypeAlias = torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]
+
+
+def _layer_ordered_kv_caches(kv_caches: dict[str, Any], device: torch.device | None = None) -> list[torch.Tensor]:
+    """Flatten the runner's ``name -> view`` mapping in model-layer order.
+
+    Hybrid caches are registered group-by-group (all full-attention layers, then each mamba
+    group), so the runner's flat list is not model-layer order. Resolve the owning layer from
+    the cache name instead, then flatten in ascending layer order for the adapters.
+    """
+    by_layer: defaultdict[int, list[Any]] = defaultdict(list)
+    for name, cache in kv_caches.items():
+        layer_id = extract_layer_index(name)
+        if layer_id < 0:
+            raise ValueError(f"xlite: cannot resolve a layer id from KV cache name {name!r}.")
+        by_layer[layer_id].append(cache)
+    ordered: list[torch.Tensor] = []
+    for layer_id in sorted(by_layer):
+        for cache in by_layer[layer_id]:
+            for tensor in cache if isinstance(cache, (tuple, list)) else (cache,):
+                if tensor is not None and (device is None or tensor.device == device):
+                    ordered.append(tensor)
+    return ordered
 
 
 def _to_int32(t: torch.Tensor) -> torch.Tensor:
@@ -608,6 +632,7 @@ class Qwen35XliteModel(StandardXliteModel):
 
     _attn_metadata_type = (XliteModelBase._attn_metadata_type, GDNAttentionMetadata)
     _attn_meta_version = 2
+    _layer_major_kv_cache = True
     # "Qwen3_5*ForConditionalGeneration": the open-weight checkpoints are the VLM-wrapped
     # architectures (text_config + vision tower); text layers resolve via the shared
     # language_model.* prefix path and the ViT stays on the native inputs_embeds route.
@@ -815,15 +840,18 @@ class Qwen35XliteModel(StandardXliteModel):
                 xlite_model.se_gate = [layer.mlp.shared_expert_gate.weight for layer in moe_layers]
                 xlite_config.n_shared_experts = 1
 
-    def extract_kv_cache(self, kv_caches: list[torch.Tensor], /) -> list[tuple[torch.Tensor, ...]]:
-        """Split the flat cache list into per-layer family tuples.
+    def extract_kv_cache(self, kv_caches: list[torch.Tensor] | dict[str, Any], /) -> list[tuple[torch.Tensor, ...]]:
+        """Split the cache list into per-layer family tuples.
 
+        The V2 runner passes its ``name -> view`` mapping; flatten it in model-layer order so
+        group-by-group registration cannot swap KDA states. A flat list is still accepted for V1.
         Families are matched by (dtype, ndim) signatures — the fp32 KDA ssm state is the only
         fp32 family; full-attention layers register one fused ``[2, ...]`` tensor (V1) or a pair
-        of adjacent 4D k/v views (V2/MRV2 regrouping). Pairing follows the deterministic
-        per-layer registration order; optional trailing MTP layers are dropped by the
-        per-family counts. KDA layers -> ``(conv, ssm)``; full-attention layers -> ``(k, v)``.
+        of adjacent 4D k/v views (V2/MRV2 regrouping). KDA layers -> ``(conv, ssm)``;
+        full-attention layers -> ``(k, v)``.
         """
+        if isinstance(kv_caches, dict):
+            kv_caches = _layer_ordered_kv_caches(kv_caches, self.device)
         n_layers = self.xlite_config.n_layers
         kda_set = set(self.kda_layers)
         n_kda, n_full = len(kda_set), n_layers - len(kda_set)
@@ -1101,6 +1129,7 @@ class Glm5NextXliteModel(DeepseekV32XliteModel):
     _attn_meta_version = 2
 
     _supported_architectures = ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"]
+    _layer_major_kv_cache = True
 
     def _build_model_config(self) -> None:
         # Skip the DeepseekV3/V32 chain: GLM5 has no standard qkv_proj, its indexer fields fold
@@ -1365,15 +1394,17 @@ class Glm5NextXliteModel(DeepseekV32XliteModel):
         xlite_model.re_up_gate_scale = get_layer_weights(layers, f"{re_prefix}.w13_weight_scale", **re_kwargs)
         xlite_model.re_down_scale = get_layer_weights(layers, f"{re_prefix}.w2_weight_scale", **re_kwargs)
 
-    def extract_kv_cache(self, kv_caches: list[torch.Tensor], /) -> list[tuple[torch.Tensor, ...]]:
-        """Split the flat cache list into per-layer GLM5 family tuples.
+    def extract_kv_cache(self, kv_caches: list[torch.Tensor] | dict[str, Any], /) -> list[tuple[torch.Tensor, ...]]:
+        """Split the cache list into per-layer GLM5 family tuples.
 
-        The flat list arrives in per-layer registration order; each sparse-MLA layer contributes
-        (main, indexer, tail) tensors and each KDA layer its (conv, ssm) pair. GLM5 families
-        collide on the last dim, so each family is matched by a (dtype, ndim, last-dim) signature
-        derived from the model config. KDA layers -> ``(conv, ssm)``; sparse-MLA layers ->
-        ``(main, indexer, tail)``, both in model layer order.
+        The V2 runner passes its ``name -> view`` mapping; flatten it in model-layer order so
+        group-by-group registration cannot swap KDA states. A flat list is still accepted for V1.
+        Each sparse-MLA layer contributes (main, indexer, tail) tensors and each KDA layer its
+        (conv, ssm) pair. GLM5 families collide on the last dim, so each family is matched by a
+        (dtype, ndim, last-dim) signature derived from the model config.
         """
+        if isinstance(kv_caches, dict):
+            kv_caches = _layer_ordered_kv_caches(kv_caches, self.device)
         xcfg = self.xlite_config
         n_layers = xcfg.n_layers
         kda_set = set(self.kda_layers)
@@ -1678,11 +1709,12 @@ class XliteWrapper:
         except Exception as e:  # runnable may raise various exceptions
             raise AttributeError(f"{self.__class__.__name__} object has no attribute {key}") from e
 
-    def register_kv_caches(self, kv_caches: list[torch.Tensor]) -> None:
+    def register_kv_caches(self, kv_caches: list[torch.Tensor] | dict[str, Any]) -> None:
         """Register KV cache references used by xlite runtime.
 
         Args:
-            kv_caches (list[torch.Tensor]): Runtime KV cache handles or tensors.
+            kv_caches (list[torch.Tensor] | dict[str, Any]): Runtime KV cache handles/tensors, or
+                the V2 runner's ``name -> view`` mapping for layer-aware hybrid adapters.
         """
         self.kv_caches = self.adapter_xlite_model.extract_kv_cache(kv_caches)
 

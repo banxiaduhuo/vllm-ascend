@@ -168,7 +168,11 @@ class XliteModelRunnerV2(XliteModelRunnerMixin, NPUModelRunnerV2):  # type: igno
         super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context=kv_cache_allocation_context)
         kv_caches: list[torch.Tensor] = self._get_flattened_kv_caches(self.kv_caches, check_is_contiguous=False)
         logger.info_once("xlite: registering kv caches to runner model: %s", _TensorRepr(kv_caches, max_it=None))
-        self.runner_model.register_kv_caches(kv_caches)
+        cache_map = getattr(self, "_kv_caches_dict", None)
+        if cache_map is not None and getattr(self.runner_model.adapter_xlite_model, "_layer_major_kv_cache", False):
+            self.runner_model.register_kv_caches(cache_map)
+        else:
+            self.runner_model.register_kv_caches(kv_caches)
 
         # check attention metadata backend compatibility
         ascend_metadata_builder = self.attn_groups[0][-1].get_metadata_builder(0)
