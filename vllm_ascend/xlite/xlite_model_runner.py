@@ -168,6 +168,24 @@ class XliteModelRunnerV2(XliteModelRunnerMixin, NPUModelRunnerV2):  # type: igno
         super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context=kv_cache_allocation_context)
         kv_caches: list[torch.Tensor] = self._get_flattened_kv_caches(self.kv_caches, check_is_contiguous=False)
         logger.info_once("xlite: registering kv caches to runner model: %s", _TensorRepr(kv_caches, max_it=None))
+        import re
+        layer_ids: list[int] = []
+        try:
+            groups = list(getattr(kv_cache_config, "kv_cache_groups", []) or [])
+            all_names = [nm for g in groups for nm in (getattr(g, "layer_names", []) or [])]
+            per = max(1, len(kv_caches) // len(all_names)) if all_names else 1
+            for gi, g in enumerate(groups):
+                names = list(getattr(g, "layer_names", []) or [])
+                for nm in names:
+                    m = re.search(r"layers\.(\d+)\.", nm)
+                    layer_ids.extend([int(m.group(1)) if m else -1] * per)
+        except Exception as exc:
+            logger.info("xlite: flat layer-id mapping failed (%s); falling back to order pairing", exc)
+            layer_ids = []
+        if layer_ids and len(layer_ids) != len(kv_caches):
+            logger.info("xlite: flat layer-id length mismatch (%d vs %d); falling back", len(layer_ids), len(kv_caches))
+            layer_ids = []
+        self.runner_model.flat_layer_ids = layer_ids
         self.runner_model.register_kv_caches(kv_caches)
 
         # check attention metadata backend compatibility

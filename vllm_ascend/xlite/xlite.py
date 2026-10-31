@@ -816,45 +816,58 @@ class Qwen35XliteModel(StandardXliteModel):
                 xlite_config.n_shared_experts = 1
 
     def extract_kv_cache(self, kv_caches: list[torch.Tensor], /) -> list[tuple[torch.Tensor, ...]]:
-        """Split the flat cache list into per-layer family tuples.
+        """Pair every layer with its own cache tensors.
 
-        Families are matched by (dtype, ndim) signatures — the fp32 KDA ssm state is the only
-        fp32 family; full-attention layers register one fused ``[2, ...]`` tensor (V1) or a pair
-        of adjacent 4D k/v views (V2/MRV2 regrouping). Pairing follows the deterministic
-        per-layer registration order; optional trailing MTP layers are dropped by the
-        per-family counts. KDA layers -> ``(conv, ssm)``; full-attention layers -> ``(k, v)``.
+        vLLM flattens hybrid caches group-by-group (all full-attention layers first, then one
+        mamba group after another), so the flat order is NOT layer order. The owning layer of
+        every entry therefore comes from ``kv_cache_config.kv_cache_groups`` (``flat_layer_ids``)
+        instead of being assumed: a KDA layer contributes its ``(conv, ssm)`` pair, a
+        full-attention layer either a fused ``[2, ...]`` tensor (V1) or separate ``(k, v)`` views
+        (V2/MRV2). Trailing MTP layers (ids >= ``n_layers``) are not part of the xlite graph.
         """
+        flat_ids = getattr(self, "flat_layer_ids", None)
+        if not flat_ids:
+            raise RuntimeError(
+                "xlite qwen3.5: flat layer ids unavailable; the hybrid cache layout cannot be "
+                "resolved from list order. Have initialize_kv_cache() populate `flat_layer_ids` "
+                "from kv_cache_config.kv_cache_groups."
+            )
+        if len(flat_ids) != len(kv_caches):
+            raise RuntimeError(
+                "xlite qwen3.5: flat layer ids (%d) do not match the cache list (%d)."
+                % (len(flat_ids), len(kv_caches))
+            )
+
         n_layers = self.xlite_config.n_layers
         kda_set = set(self.kda_layers)
-        n_kda, n_full = len(kda_set), n_layers - len(kda_set)
+        by_layer: dict[int, list[torch.Tensor]] = {}
+        for lid, tensor in zip(flat_ids, kv_caches):
+            if lid < 0:
+                raise RuntimeError(
+                    "xlite qwen3.5: unparsable layer id %d in kv_cache_config.kv_cache_groups." % lid
+                )
+            if lid >= n_layers:
+                continue  # trailing MTP layers stay outside the xlite graph
+            by_layer.setdefault(lid, []).append(tensor)
 
-        fulls: list[torch.Tensor] = []
-        convs: list[torch.Tensor] = []
-        ssms: list[torch.Tensor] = []
-        for t in kv_caches:
-            if t.dtype == self.dtype:
-                if t.dim() == 5 and t.shape[0] == 2:
-                    fulls.append(t)  # V1 flat path: fused k/v
-                elif t.dim() == 4:
-                    fulls.append(t)  # V2/MRV2: per-layer k or v view of the fused parent
-                else:
-                    convs.append(t)  # KDA conv state (paged or slot-major)
+        result: list[tuple[torch.Tensor, ...]] = []
+        for layer in range(n_layers):
+            tensors = by_layer.get(layer, [])
+            if len(tensors) == 1 and tensors[0].dim() == 5 and tensors[0].shape[0] == 2:
+                result.append((tensors[0][0], tensors[0][1]))  # V1 fused k/v tensor
+                continue
+            if len(tensors) != 2:
+                raise RuntimeError(
+                    "xlite qwen3.5: layer %d owns %d cache tensors (expected 1 fused or 2)."
+                    % (layer, len(tensors))
+                )
+            first, second = tensors
+            if layer in kda_set:
+                conv, ssm = (first, second) if first.dtype != torch.float32 else (second, first)
+                result.append((conv, ssm))
             else:
-                ssms.append(t)  # KDA recurrent state (fp32)
-        for fam, family_list, expected in (("full", fulls, n_full), ("conv", convs, n_kda), ("ssm", ssms, n_kda)):
-            if len(family_list) < expected:
-                raise ValueError(f"xlite qwen3.5: {fam} cache count mismatch ({len(family_list)} vs. {expected}).")
-
-        if fulls[0].dim() == 5:
-            full_views = [(t[0], t[1]) for t in fulls[:n_full]]
-        else:
-            if len(fulls) < 2 * n_full:
-                raise ValueError(f"xlite qwen3.5: full cache count mismatch ({len(fulls)} vs. {2 * n_full}).")
-            full_views = [(fulls[2 * j], fulls[2 * j + 1]) for j in range(n_full)]
-        full_caches = {layer: view for layer, view in zip(self.full_attn_layers, full_views)}
-        kda_caches = {layer: (conv, ssm) for layer, conv, ssm in zip(self.kda_layers, convs[:n_kda], ssms[:n_kda])}
-        result = [kda_caches[i] if i in kda_set else full_caches[i] for i in range(n_layers)]
-        logger.info_once("xlite qwen3.5: registered kv caches (flat): %s", _TensorRepr(result, max_it=None))
+                result.append((first, second))
+        logger.info_once("xlite qwen3.5: paired kv caches by layer id (%d layers)", n_layers)
         return result
 
     def build_attn_meta_v2(self, attn_metadata: dict[str, Any], positions: torch.Tensor) -> tuple[Any, int]:
@@ -1684,6 +1697,7 @@ class XliteWrapper:
         Args:
             kv_caches (list[torch.Tensor]): Runtime KV cache handles or tensors.
         """
+        self.adapter_xlite_model.flat_layer_ids = getattr(self, "flat_layer_ids", None)
         self.kv_caches = self.adapter_xlite_model.extract_kv_cache(kv_caches)
 
     def __call__(
