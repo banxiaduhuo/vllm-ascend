@@ -172,6 +172,15 @@ class XliteModelRunnerV2(XliteModelRunnerMixin, NPUModelRunnerV2):  # type: igno
         self, kv_cache_config: KVCacheConfig, kv_cache_allocation_context: AbstractContextManager | None = None
     ) -> None:
         super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context=kv_cache_allocation_context)
-        kv_caches: list[torch.Tensor] = self._get_flattened_kv_caches(self.kv_caches, check_is_contiguous=False)
-        logger.info_once("xlite: registering kv caches to runner model: %s", _TensorRepr(kv_caches, max_it=None))
+        flat_caches = self._get_flattened_kv_caches(self.kv_caches, check_is_contiguous=False)
+        cache_map = getattr(self, "_kv_caches_dict", None)
+        if cache_map is not None and getattr(self.runner_model.adapter_xlite_model, "_layer_major_kv_cache", False):
+            kv_caches = cache_map
+            log_caches = flat_caches
+        elif getattr(self.runner_model, "structured_kv_cache", False):
+            kv_caches = self.kv_caches
+            log_caches = flat_caches
+        else:
+            kv_caches = log_caches = flat_caches
+        logger.info_once("xlite: registering kv caches to runner model: %s", _TensorRepr(log_caches, max_it=None))
         self.runner_model.register_kv_caches(kv_caches)
