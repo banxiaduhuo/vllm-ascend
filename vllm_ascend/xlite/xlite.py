@@ -826,21 +826,57 @@ class HybridXliteModel(StandardXliteModel):
         """Pick the main full-attention group's common metadata (group 0 may be a KDA group)."""
         return by_group[self._group_id(kv_cache_groups, self._main_attn_group(kv_cache_groups))]
 
+    def _accepted_state_page(self, group: Any, table: torch.Tensor, num_accepted: torch.Tensor | None) -> torch.Tensor:
+        """Point column 0 at the accepted mamba state page for this request.
+
+        The xlite kernels only read state column 0. During a verify step the
+        remaining columns are the per-draft snapshot pages; vllm-ascend selects
+        the accepted one here instead of passing num_accepted into the kernel.
+        """
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        if not isinstance(group.kv_cache_spec, MambaSpec) or table.dim() != 2 or table.shape[1] <= 1:
+            return table
+        if num_accepted is None:
+            # No speculative rows: expose only the committed column so the
+            # xlite prefill path commits the final state as usual.
+            return table[:, :1].contiguous()
+        rows = min(table.shape[0], num_accepted.numel())
+        if rows == 0:
+            return table
+        counts = num_accepted[:rows].to(device=table.device, dtype=torch.long)
+        cols = (counts - 1).clamp_(0, table.shape[1] - 1)
+        resolved = table.clone()
+        resolved[:rows, 0] = table[:rows].gather(1, cols.unsqueeze(1)).squeeze(1)
+        # A zero accepted count marks a non-speculative row. Clear its scratch
+        # columns so the kernel commits that row's final state normally.
+        resolved[:rows, 1:].masked_fill_((counts == 0).unsqueeze(1), 0)
+        return resolved
+
     def augment_attn_meta(
         self,
         meta: AttnMetaV2,
         by_group: dict[int, Any],
         kv_cache_groups: Sequence[Any],
         is_dummy: bool,
+        num_accepted: torch.Tensor | None = None,
     ) -> None:
-        """Append the extra family block tables to the main-KV slot, verbatim."""
+        """Append the extra family block tables to the main-KV slot."""
+        from vllm.v1.kv_cache_interface import MambaSpec
+
         tables = []
+        mamba_mode = getattr(self.vllm_config.cache_config, "mamba_cache_mode", None)
         for group in self._extra_attn_groups(kv_cache_groups):
-            tables.append(
-                torch.zeros((1, 1), dtype=torch.int32, device=self.device)
-                if is_dummy
-                else by_group[self._group_id(kv_cache_groups, group)].block_table_tensor
-            )
+            if is_dummy:
+                tables.append(torch.zeros((1, 1), dtype=torch.int32, device=self.device))
+                continue
+            table = by_group[self._group_id(kv_cache_groups, group)].block_table_tensor
+            if isinstance(group.kv_cache_spec, MambaSpec) and table.shape[1] > 1 and mamba_mode not in (None, "none"):
+                raise NotImplementedError(
+                    "xlite hybrid state tables require mamba_cache_mode='none'; "
+                    f"got {mamba_mode!r} with table width {table.shape[1]}"
+                )
+            tables.append(self._accepted_state_page(group, table, num_accepted))
         # Rebuild from the common main-KV slot so repeated dummy runs stay idempotent.
         meta.block_tables = [*meta.block_tables[:1], *tables]
 
@@ -1945,6 +1981,32 @@ class XliteWrapper:
         config = getattr(self.npu_runner, "kv_cache_config", None)
         return list(config.kv_cache_groups) if config is not None else []
 
+    def _num_accepted_tokens(self) -> torch.Tensor | None:
+        """Per-request accepted counts from the native GDN metadata, if spec decode is active."""
+        attn_metadata = get_forward_context().attn_metadata
+        values = attn_metadata.values() if isinstance(attn_metadata, dict) else attn_metadata
+        for metadata in values if values is not None else ():
+            accepted = getattr(metadata, "num_accepted_tokens", None)
+            if accepted is None:
+                continue
+            # GDN metadata keeps accepted counts for speculative rows only, in
+            # the original request order. Expand them to the full batch so the
+            # xlite state table rows line up with the common block tables.
+            spec_rows = getattr(metadata, "spec_sequence_masks", None)
+            if spec_rows is not None:
+                mask = spec_rows.to(device=accepted.device, dtype=torch.bool)
+                if mask.numel() > accepted.numel():
+                    expanded = torch.zeros(mask.numel(), dtype=accepted.dtype, device=accepted.device)
+                    expanded[mask] = accepted
+                    return expanded
+                if mask.numel() == accepted.numel():
+                    # Full-graph padding keeps accepted at graph width and
+                    # appends dummy ones after the real rows. Zero the padded
+                    # rows so they are not treated as speculative state rows.
+                    return torch.where(mask, accepted, torch.zeros_like(accepted))
+            return accepted
+        return None
+
     def _common_attn_metadata(self) -> AscendCommonAttentionMetadata:
         """Return the main full-attention group's common attention metadata.
 
@@ -2052,6 +2114,7 @@ class XliteWrapper:
                 self._common_attn_metadata_by_group(),
                 self._kv_cache_groups(),
                 self._is_dummy_batch,
+                self._num_accepted_tokens(),
             )
 
         # under DP, `num_tokens` is the max number of tokens across all DP ranks for data alignment
