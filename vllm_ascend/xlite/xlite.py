@@ -902,6 +902,50 @@ class HybridXliteModel(StandardXliteModel):
         return result
 
 
+_hybrid_common_md_bridge_installed = False
+
+
+def install_hybrid_common_metadata_bridge() -> None:
+    """Wire the V2 per-group common-metadata channel into the hybrid model state.
+
+    基线(48ae9acde)只为 default state 接了 common_metadata_callback(见基座
+    default.py prepare_attn 中 `xlite_graph_config.enabled` 分支),而
+    AscendMambaHybridModelState.prepare_attn 不注册——hybrid attention 是本
+    适配首个使用者。这里按 default 相同语义补上生产者:每步重建 per-group
+    表并把逐组 callback 注入 build_attn_metadata;消费端(_common_attn_metadata_by_group /
+    select_main_common_group)无需改动。基座将来补上同样接线后可直接删除本桥接。
+    """
+    global _hybrid_common_md_bridge_installed
+    if _hybrid_common_md_bridge_installed:
+        return
+    from vllm_ascend.worker.v2.model_states import mamba_hybrid as mh
+
+    orig_prepare_attn = mh.AscendMambaHybridModelState.prepare_attn
+    orig_build_attn_metadata = mh.build_attn_metadata
+    # V2 worker 单线程串行 prepare,模块级信封把 model_state 实例接给 build 包装层。
+    building: list[Any] = []
+
+    def prepare_attn(self: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        # 对齐 default.py:每步重建 per-group common 表(避免跨步引用陈旧 metadata)。
+        self._decoder_replay_common_metadata = {}
+        building.append(self)
+        try:
+            return orig_prepare_attn(self, *args, **kwargs)
+        finally:
+            building.clear()
+
+    def build_attn_metadata(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        if building and kwargs.get("common_metadata_callback") is None:
+            sink = building[0]._decoder_replay_common_metadata
+            kwargs["common_metadata_callback"] = lambda group_id, common: sink.__setitem__(group_id, common)
+        return orig_build_attn_metadata(*args, **kwargs)
+
+    mh.AscendMambaHybridModelState.prepare_attn = prepare_attn
+    mh.build_attn_metadata = build_attn_metadata  # _build_attn_metadata_for_batch 走模块全局名,重绑即生效
+    _hybrid_common_md_bridge_installed = True
+    logger.info_once("xlite: hybrid common-metadata bridge installed")
+
+
 class Qwen35XliteModel(HybridXliteModel):
     """xlite adapter for Qwen3.5: hybrid GatedDeltaNet (KDA) linear attention + GQA full attention.
 
@@ -1341,9 +1385,9 @@ class Glm5NextXliteModel(HybridXliteModel, DeepseekV32XliteModel):
         xlite_config.kv_lora_rank = hf_config.kv_lora_rank
         xlite_config.softmax_scale = (hf_config.qk_nope_head_dim + hf_config.qk_rope_head_dim) ** -0.5
 
-        # MHC residual mixing (Glm5NextConfig folds hc_mult/hc_sinkhorn_iters into the aliases).
-        xlite_config.hc_mult = hf_config.mhc_num_residual_streams
-        xlite_config.hc_sinkhorn_iters = hf_config.mhc_sinkhorn_iterations or 20
+        # MHC residual mixing (transformers 5.16.1~5.19 字段即 hc_mult/hc_sinkhorn_iters,config.json 同名).
+        xlite_config.hc_mult = hf_config.hc_mult
+        xlite_config.hc_sinkhorn_iters = hf_config.hc_sinkhorn_iters
         xlite_config.hc_eps = hf_config.hc_eps
 
         # KDA linear-attention dims (q/k/v share the same head layout).
@@ -1391,7 +1435,7 @@ class Glm5NextXliteModel(HybridXliteModel, DeepseekV32XliteModel):
         xlite_config.n_dense_layers = getattr(hf_config, "first_k_dense_replace", 0)
         xlite_config.n_routed_experts = hf_config.n_routed_experts
         xlite_config.n_shared_experts = hf_config.n_shared_experts
-        xlite_config.n_act_experts = hf_config.num_experts_per_token
+        xlite_config.n_act_experts = hf_config.num_experts_per_tok
         xlite_config.n_expert_groups = getattr(hf_config, "n_group", 1)
         xlite_config.n_limited_groups = getattr(hf_config, "topk_group", 1)
         xlite_config.moe_intermediate_size = hf_config.moe_intermediate_size
@@ -1775,6 +1819,9 @@ class XliteWrapper:
 
         set_dummy_tensor(torch.empty(1, device=device, dtype=vllm_config.model_config.dtype))
         self.adapter_xlite_model = get_adapter_xlite_model(npu_runner, vllm_config)  # python adapter instance
+        # V2 hybrid 模型缺 per-group common metadata 生产者(基线只接了 default state),安装桥接。
+        if self.use_v2_model_runner and isinstance(self.adapter_xlite_model, HybridXliteModel):
+            install_hybrid_common_metadata_bridge()
         self.xlite_model = self.adapter_xlite_model.xlite_model  # xlite C++ model instance
         self.freq_cis = self.adapter_xlite_model.rope_cossin_cache
         xlite_config = self.adapter_xlite_model.xlite_config
@@ -1888,7 +1935,9 @@ class XliteWrapper:
         V1 keeps a single group-0 object on the runner.
         """
         if (model_state := getattr(self.npu_runner, "model_state", None)) is not None:
-            return model_state._decoder_replay_common_metadata
+            # model_state 未初始化 decoder replay(如模型无 decoder_replay_layers 时基座
+            # _initialize_decoder_replay 提前 return)时返回空表,而非 AttributeError
+            return getattr(model_state, "_decoder_replay_common_metadata", None) or {}
         common = getattr(self.npu_runner, "_decoder_replay_common_metadata", None)
         return {0: common} if common is not None else {}
 
@@ -1905,7 +1954,8 @@ class XliteWrapper:
         select = getattr(self.adapter_xlite_model, "select_main_common_group", None)
         if select is None:
             if (model_state := getattr(self.npu_runner, "model_state", None)) is not None:
-                return model_state._decoder_replay_common_metadata[0]
+                common_by_group = getattr(model_state, "_decoder_replay_common_metadata", None) or {}
+                return common_by_group[0]
             return self.npu_runner._decoder_replay_common_metadata
         return select(self._common_attn_metadata_by_group(), self._kv_cache_groups())
 
