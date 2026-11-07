@@ -73,6 +73,11 @@ if TYPE_CHECKING:
 XliteForwardResult: TypeAlias = torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]
 
 
+def _to_fp32(t: torch.Tensor) -> torch.Tensor:
+    """Cast a weight/bias tensor to fp32 (GLM5 indexer / MHC params are fp32-native)."""
+    return t.to(torch.float32)
+
+
 def _slice_rows(start: int, length: int) -> Callable[[torch.Tensor], torch.Tensor]:
     """Keep rows ``[start, start + length)`` in weights and their per-output-row quant tensors."""
 
@@ -649,7 +654,7 @@ class StandardXliteModel(XliteModelBase):
             layers,
             f"{mlp_prefix}.gate.e_score_correction_bias",
             f"{mlp_prefix}.e_score_correction_bias",  # for MiniMax-2.x compatibility
-            post_processor=lambda b: b.to(torch.float32),  # type conversion for numerical stability in xlite backend
+            post_processor=_to_fp32,  # numerical stability in the xlite backend
         )
         se = f"{mlp_prefix}.{self._shared_experts_module}"
         self.init_matmul_weights(layers, "se_up_gate", f"{se}.gate_up_proj")
@@ -952,10 +957,6 @@ class HybridXliteBase(XliteModelBase):
             )
         return cache
 
-    def _alloc_tail_rings(self) -> list[torch.Tensor]:
-        """Allocate the constant zero rings for the kpool-compressed tail family (default: none)."""
-        return []
-
     def _make_full_layer_cache(self, layer: int, entries: Sequence[Any]) -> tuple[torch.Tensor, ...]:
         """Build the full-attention family tuple for one layer (adapter-specific)."""
         raise NotImplementedError
@@ -992,7 +993,6 @@ class HybridXliteBase(XliteModelBase):
         Resolve ownership from the name (`layers.<N>`) so group-by-group registration cannot swap
         hybrid states. The V1 flat list cannot express hybrid ownership — this adapter is V2-only.
         """
-        self._tail_rings = self._alloc_tail_rings()
         by_layer = _kv_cache_by_layer(kv_caches)
         result: list[tuple[torch.Tensor, ...]] = []
         for layer in range(self.xlite_config.n_layers):
@@ -1216,18 +1216,10 @@ class DeepseekV3XliteModel(Glm4MoeXliteModel):
 
     def _build_model(self) -> None:
         super()._build_model()
-        xlite_model, xlite_config = self.xlite_model, self.xlite_config
+        xlite_model = self.xlite_model
         layers, _ = self._get_layers_and_model_prefix()
 
-        # MLA attention weights
-        self.init_matmul_weights(layers, "mla_qkv_a", "self_attn.fused_qkv_a_proj")
-        self.init_matmul_weights(layers, "mla_q_b", "self_attn.q_b_proj")
-        xlite_model.mla_q_norm = get_layer_weights(layers, "self_attn.q_a_layernorm.weight")
-        xlite_model.mla_kv_norm = get_layer_weights(layers, "self_attn.kv_a_layernorm.weight")
-        xlite_model.mla_wuv = get_layer_weights(layers, "self_attn.mla_attn.mla_attn.impl.W_UV")
-        xlite_model.mla_wuk_t = get_layer_weights(layers, "self_attn.mla_attn.mla_attn.impl.W_UK_T")
-        xlite_config.mla_wuv_weight_nz = self.probe_nz(xlite_model.mla_wuv)
-        xlite_config.mla_wukt_weight_nz = self.probe_nz(xlite_model.mla_wuk_t)
+        self._bind_mla_weights(layers)
 
         if not self.quantization:
             return
@@ -1237,6 +1229,22 @@ class DeepseekV3XliteModel(Glm4MoeXliteModel):
         with xlite_model.condition(lambda tensors: not self.all_tensors_zero(tensors)):
             xlite_model.mla_q_norm_bias = get_layer_weights(layers, "self_attn.q_a_layernorm.bias")
             xlite_model.mla_kv_norm_bias = get_layer_weights(layers, "self_attn.kv_a_layernorm.bias")
+
+    def _bind_mla_weights(self, layers: Sequence[nn.Module], mask: Sequence[bool] | None = None) -> None:
+        """Bind the MLA latent projections, q/kv norms and per-head W_UV / W_UK_T slots.
+
+        Shared with the hybrid sparse-MLA adapters, which pass ``mask`` to keep every slot
+        list index-aligned with the (hybrid) layer list.
+        """
+        xlite_model, xlite_config = self.xlite_model, self.xlite_config
+        self.init_matmul_weights(layers, "mla_qkv_a", "self_attn.fused_qkv_a_proj", mask=mask)
+        self.init_matmul_weights(layers, "mla_q_b", "self_attn.q_b_proj", mask=mask)
+        xlite_model.mla_q_norm = get_layer_weights(layers, "self_attn.q_a_layernorm.weight", mask=mask)
+        xlite_model.mla_kv_norm = get_layer_weights(layers, "self_attn.kv_a_layernorm.weight", mask=mask)
+        xlite_model.mla_wuv = get_layer_weights(layers, "self_attn.mla_attn.mla_attn.impl.W_UV", mask=mask)
+        xlite_model.mla_wuk_t = get_layer_weights(layers, "self_attn.mla_attn.mla_attn.impl.W_UK_T", mask=mask)
+        xlite_config.mla_wuv_weight_nz = self.probe_nz(xlite_model.mla_wuv)
+        xlite_config.mla_wukt_weight_nz = self.probe_nz(xlite_model.mla_wuk_t)
 
     def _precompute_rope_cache(self) -> torch.Tensor:
         # TODO: remove this method once `xlite` no longer requires complex64 format
@@ -1312,6 +1320,283 @@ class DeepseekV32XliteModel(DeepseekV3XliteModel):
             if not mask:
                 index_caches.insert(i, _DUMMY_TENSOR)
         return [(mla_cache[0], mla_cache[1], i_cache) for mla_cache, i_cache in zip(mla_caches, index_caches)]
+
+
+class Glm5NextXliteModel(HybridXliteBase, DeepseekV32XliteModel):
+    """xlite adapter for GLM-5.3-Flash (glm5_next): hybrid KDA linear attention + NoPE sparse MLA + MHC + MoE.
+
+    Reuses the DeepseekV32 DSA plumbing (SFA metadata, indexer cache slots) but rebuilds the
+    config/weight binding for the two attention families (KDA ``linear_attention`` with fused
+    ``in_proj_qkvbfg_a``, sparse MLA with per-layer kpool indexer) and the MHC residual streams.
+
+    Metadata is assembled into :class:`AttnMetaV2` from the runner's raw per-family block tables;
+    KV caches are consumed structurally: a sparse-MLA layer owns ``(main, indexer, tail)`` runner
+    entries and a KDA layer owns one ``(conv, ssm)`` entry.
+    """
+
+    from vllm_ascend.attention.indexer_kpool import (  # noqa: F401  (re-exported for tests)
+        AscendIndexerKPoolMetadata,
+        AscendIndexerKPoolTailMetadata,
+    )
+
+    _supported_architectures = ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"]
+    # Attention quant applies to the sparse-MLA latent projections (KDA stays BF16).
+    _quant_attn_probe_slot: str = "mla_qkv_a"
+
+    def _build_model_config(self) -> None:
+        # Walk the full DeepseekV3/V32 chain via super(); GLM5 overrides the attention type
+        # (AttnHybridKda) and folds the indexer fields its own way below. Glm5NextConfig
+        # declares head_dim=None (MLA latent layout); the Standard base leaves softmax_scale
+        # unset for it.
+        if getattr(self.vllm_config.parallel_config, "prefill_context_parallel_size", 1) > 1:
+            raise NotImplementedError("xlite: prefill context parallelism is not supported.")
+        super()._build_model_config()
+        xlite_config, hf_config = self.xlite_config, self.hf_text_config
+
+        # Attention type & MLA latent dims (NoPE sparse MLA: rope only on the K tail).
+        # AttnHybridKda: dedicated C++ dispatch (per-layer KDA-linear vs sparse-MLA via kda_layers).
+        xlite_config.attn_type = AttnHybridKda
+        xlite_config.n_kv_heads = 1
+        xlite_config.head_dim = 0
+        xlite_config.rope_head_dim = hf_config.qk_rope_head_dim
+        xlite_config.nope_head_dim = hf_config.qk_nope_head_dim
+        xlite_config.v_head_dim = hf_config.v_head_dim
+        xlite_config.q_lora_rank = hf_config.q_lora_rank
+        xlite_config.kv_lora_rank = hf_config.kv_lora_rank
+        xlite_config.softmax_scale = (hf_config.qk_nope_head_dim + hf_config.qk_rope_head_dim) ** -0.5
+
+        # MHC residual mixing (hc_mult / hc_sinkhorn_iters, same names as in config.json).
+        xlite_config.hc_mult = hf_config.hc_mult
+        xlite_config.hc_sinkhorn_iters = hf_config.hc_sinkhorn_iters
+        xlite_config.hc_eps = hf_config.hc_eps
+
+        # KDA linear-attention dims (q/k/v share the same head layout).
+        xlite_config.linear_num_k_heads = hf_config.linear_num_heads
+        xlite_config.linear_num_v_heads = hf_config.linear_num_heads
+        xlite_config.linear_key_head_dim = hf_config.linear_head_dim
+        xlite_config.linear_value_head_dim = hf_config.linear_head_dim
+        xlite_config.linear_conv_kernel_dim = hf_config.linear_conv_kernel_dim
+        # KDA safe_gate lower bound (C++ gateLowerBound; native: kda.py kda_lower_bound).
+        xlite_config.gate_lower_bound = float(hf_config.linear_lower_bound)
+
+        # kpool indexer (sparse MLA layers): kpool>1 enables the compress+spill path.
+        compress_ratio = int(hf_config.index_kpool)
+        xlite_config.index_kpool = compress_ratio
+        xlite_config.index_kpool_compress = compress_ratio > 1
+        xlite_config.index_head_dim = hf_config.index_head_dim
+        xlite_config.index_n_heads = hf_config.index_n_heads
+        xlite_config.index_topk = hf_config.index_topk
+        xlite_config.index_softmax_scale = hf_config.index_head_dim**-0.5
+        xlite_config.index_rope_interleaved = getattr(hf_config, "indexer_rope_interleave", False)
+        # All GLM5 sparse layers use the full (non-sliding) indexer mask; per-layer KDA-vs-MLA
+        # attention dispatch is carried by the C++ model init (the masks below stay python-side
+        # for weight mapping only).
+        xlite_config.index_full_mask = [True] * xlite_config.n_layers
+
+        # block_sizes is the family vector [main kernel page, pooled entries per main page, tail
+        # ring capacity] and compress_ratios is per-layer (the C++ derives the indexer pool/tail
+        # slots from these). XModel copies this config at construction, so the values must be
+        # pinned here — patching after C++ init has no effect. The shared hook also pins
+        # block_size and rounds max_seq_len up to whole manager pages.
+        from vllm_ascend.attention.sfa_v1 import AscendSFABackend
+        from vllm_ascend.models.glm5next.kv_cache import get_kpool_tail_ring_capacity
+
+        main_block = self._pin_cache_geometry([AscendSFABackend])
+        xlite_config.block_sizes = [
+            main_block,
+            main_block // compress_ratio,
+            get_kpool_tail_ring_capacity(self.vllm_config, compress_ratio),
+        ]
+        xlite_config.compress_ratios = [compress_ratio] * xlite_config.n_layers
+
+        # MoE (W8A8 routed/shared experts, BF16 gate; dense layers use standard MLP slots).
+        xlite_config.n_dense_layers = getattr(hf_config, "first_k_dense_replace", 0)
+        xlite_config.n_routed_experts = hf_config.n_routed_experts
+        xlite_config.n_shared_experts = hf_config.n_shared_experts
+        xlite_config.n_act_experts = hf_config.num_experts_per_tok
+        xlite_config.n_expert_groups = getattr(hf_config, "n_group", 1)
+        xlite_config.n_limited_groups = getattr(hf_config, "topk_group", 1)
+        xlite_config.moe_intermediate_size = hf_config.moe_intermediate_size
+        xlite_config.intermediate_size = hf_config.intermediate_size
+        xlite_config.norm_topk_prob = True
+        xlite_config.scoring_func = ScoringFuncSigmoid
+        xlite_config.route_scale = getattr(hf_config, "routed_scaling_factor", 1.0)
+        xlite_config.swiglu_limit = getattr(hf_config, "swiglu_limit", 0.0) or 0.0
+
+    def _bind_full_layer_weights(self, layers: Sequence[nn.Module], full_mask: Sequence[bool]) -> None:
+        """Sparse-MLA + kpool indexer slots (non-KDA layers, i.e. ``full_mask``)."""
+        self._bind_mla_weights(layers, full_mask)
+        self.init_matmul_weights(layers, "attn_out", "self_attn.o_proj", mask=full_mask)
+        self._bind_indexer_weights(layers, full_mask)
+
+    def _bind_plain_slots(
+        self,
+        layers: Sequence[nn.Module],
+        mask: Sequence[bool] | None,
+        slots: Mapping[str, str],
+        post: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> None:
+        """Bind plain (non-matmul) per-layer slots in one pass: ``{xlite_slot: dotted source path}``."""
+        for slot, path in slots.items():
+            setattr(self.xlite_model, slot, get_layer_weights(layers, path, mask=mask, post_processor=post))
+
+    def get_sliced_weights(
+        self,
+        layers: Sequence[nn.Module],
+        source: str,
+        mask: Sequence[bool] | None,
+        slices: Mapping[str, tuple[int, int]],
+    ) -> dict[str, list[torch.Tensor]]:
+        """Split one plain (non-matmul) fused source into per-slot row windows, one layer walk."""
+        fused = get_layer_weights(layers, source, mask=mask)
+        return {slot: [_slice_rows(start, length)(w) for w in fused] for slot, (start, length) in slices.items()}
+
+    def _bind_kda_layer_weights(self, layers: Sequence[nn.Module], kda_mask: Sequence[bool]) -> None:
+        """KDA (BF16) fused projection shards, conv/gate params and output projection."""
+        xlite_model = self.xlite_model
+        hf_config = self.hf_text_config
+        tp_size = self.xlite_config.def_tp_size
+        # Fused in_proj_qkvbfg_a row shards: [q, k, v (proj each), b (heads), f_a, g_a (head_dim,
+        # replicated)]. Extract once and shard per slot — the 2D row slice must no-op on the 1D
+        # _DUMMY_TENSOR for masked-out layers.
+        proj = hf_config.linear_head_dim * hf_config.linear_num_heads
+        lp = proj // tp_size  # local projection (q/k/v per rank)
+        lh = hf_config.linear_num_heads // tp_size  # local heads (b per rank)
+        hd = hf_config.linear_head_dim
+        slices = {
+            "linear_in_proj_q": (0, lp),
+            "linear_in_proj_k": (lp, lp),
+            "linear_in_proj_v": (2 * lp, lp),
+            "linear_in_proj_b": (3 * lp, lh),
+            "linear_in_proj_f_a": (3 * lp + lh, hd),
+            "linear_in_proj_g_a": (3 * lp + lh + hd, hd),
+        }
+        for slot, weights in self.get_sliced_weights(
+            layers, "self_attn.in_proj_qkvbfg_a.weight", kda_mask, slices
+        ).items():
+            setattr(xlite_model, slot, weights)
+        self.init_matmul_weights(layers, "linear_f_b_proj", "self_attn.f_b_proj", mask=kda_mask)
+        self.init_matmul_weights(layers, "linear_g_b_proj", "self_attn.g_b_proj", mask=kda_mask)
+        self.init_matmul_weights(layers, "linear_out_proj", "self_attn.o_proj", mask=kda_mask)
+        # Conv1d weights are stored fp32; the C++ kernel requires weight/activation dtype match,
+        # so mirror native's one-time cast to the activation dtype (kda.py _merged_conv_weight).
+        # NOTE: pybind def_readwrite returns a COPY of the C++ vector, so bind via setattr only.
+        self._bind_plain_slots(
+            layers,
+            kda_mask,
+            {
+                "linear_q_conv1d": "self_attn.q_conv1d.weight",
+                "linear_k_conv1d": "self_attn.k_conv1d.weight",
+                "linear_v_conv1d": "self_attn.v_conv1d.weight",
+            },
+            post=lambda w: w.to(self.dtype),
+        )
+        # rc2 stores A_log as [1, 1, local_heads, 1]; the C++ reference consumes 1-D [local_heads].
+        self._bind_plain_slots(
+            layers,
+            kda_mask,
+            {"linear_a_log": "self_attn.A_log"},
+            post=lambda w: w.reshape(-1) if w.ndim > 1 else w,
+        )
+        self._bind_plain_slots(
+            layers, kda_mask, {"linear_dt_bias": "self_attn.dt_bias", "linear_norm": "self_attn.o_norm.weight"}
+        )
+
+    def _bind_indexer_weights(self, layers: Sequence[nn.Module], mla_mask: Sequence[bool]) -> None:
+        """kpool indexer weights (MLA layers), cast to fp32 as native does after loading."""
+        xlite_model = self.xlite_model
+        idx_hd = self.hf_text_config.index_head_dim
+        self.init_matmul_weights(layers, "index_q_b", "self_attn.indexer.wq_b", mask=mla_mask)
+        # wk_weights_proj is fused [wk (idx_hd rows); weights_proj] — extract once, split per slot.
+        wk_proj = get_layer_weights(layers, "self_attn.indexer.wk_weights_proj.weight", mask=mla_mask)
+        xlite_model.index_wk = [_to_fp32(w[:idx_hd, :].contiguous() if w.ndim >= 2 else w) for w in wk_proj]
+        xlite_model.index_weights_proj = [
+            _to_fp32(w[idx_hd:, :].t().contiguous() if w.ndim >= 2 else w) for w in wk_proj
+        ]
+        # native validates the APE as fp32 [kpool, head_dim]; all indexer params cast to fp32.
+        self._bind_plain_slots(
+            layers,
+            mla_mask,
+            {
+                "index_k_norm": "self_attn.indexer.k_norm.weight",
+                "index_k_norm_bias": "self_attn.indexer.k_norm.bias",
+                "index_kpool_gate": "self_attn.indexer.index_kpool_compress_gate",
+                "index_kpool_ape": "self_attn.indexer.index_kpool_compress_ape",
+            },
+            post=_to_fp32,
+        )
+
+    def _bind_mhc_weights(self, layers: Sequence[nn.Module]) -> None:
+        """MHC residual-mixing params (fp32, every layer)."""
+        for slot in ("hc_attn_fn", "hc_attn_base", "hc_attn_scale", "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale"):
+            setattr(self.xlite_model, slot, get_layer_weights(layers, slot, post_processor=_to_fp32))
+
+    def _bind_shared_weights(self, layers: Sequence[nn.Module]) -> None:
+        """MHC residual mixing, then the common dense MLP/MoE/quant binding."""
+        self._bind_mhc_weights(layers)
+        super()._bind_shared_weights(layers)
+
+    # ---- attention metadata ----------------------------------------------------------------
+
+    @staticmethod
+    def _glm5_cache_layout(kv_cache_groups: Sequence[Any]) -> Any:
+        from vllm_ascend.models.glm5next.cache_config import _get_glm5_next_cache_layout
+
+        layout = _get_glm5_next_cache_layout(list(kv_cache_groups))
+        if layout is None:
+            raise ValueError("xlite: unrecognized KV cache group layout")
+        return layout
+
+    def _main_attn_group(self, kv_cache_groups: Sequence[Any]) -> Any:
+        return self._glm5_cache_layout(kv_cache_groups).full_group
+
+    def _extra_attn_groups(self, kv_cache_groups: Sequence[Any]) -> Sequence[Any]:
+        layout = self._glm5_cache_layout(kv_cache_groups)
+        groups = list(layout.mamba_groups)
+        # The tail-ring family exists only for kpool compression (indexKpool > 1).
+        if self.xlite_config.index_kpool > 1:
+            groups.append(layout.tail_group)
+        return groups
+
+    # ---- structured KV cache ---------------------------------------------------------------
+
+    @classmethod
+    def _cache_components(cls, entry: Any) -> list[torch.Tensor]:
+        """Extract the tensors carried by one runner cache entry (single tensor or a view group)."""
+        while isinstance(entry, (list, tuple)) and len(entry) == 1:  # unwrap runner view wrappers
+            entry = entry[0]
+        if isinstance(entry, torch.Tensor):
+            return [entry]
+        return [c for c in entry if isinstance(c, torch.Tensor)] if isinstance(entry, (list, tuple)) else []
+
+    def _make_full_layer_cache(self, layer: int, entries: Sequence[Any]) -> tuple[torch.Tensor, ...]:
+        """Build one sparse-MLA layer's family tuple: (main latent k, optional pe plane, indexer kpool, tail ring).
+
+        The tail entry is the runner's paged tail-ring pool, passed through as the
+        ``[blocks, index_kpool, 2*index_head_dim]`` fp32 view (each row is one pool
+        slot's ``[k | gate]`` pair); compress/spill is its sole consumer.
+        """
+        xcfg = self.xlite_config
+        main, indexer_entry, *tail_entries = entries
+        k_cache = next((c for c in self._cache_components(main) if c.shape[-1] == xcfg.kv_lora_rank), None)
+        if k_cache is None:
+            raise ValueError(f"xlite: layer {layer} main cache has no {xcfg.kv_lora_rank}-wide view.")
+        indexers = [c for c in self._cache_components(indexer_entry) if c.shape[-1] == xcfg.index_head_dim]
+        if len(indexers) != 1:
+            raise ValueError(f"xlite: layer {layer} has {len(indexers)} indexer kpool views, expected 1")
+        family = [k_cache, k_cache[..., :0], indexers[0]]  # NoPE: no rope plane, pe slot stays an empty view
+        if tail_entries:
+            (tail,) = self._cache_components(tail_entries[0])
+            tail = self._expect_cache_shape(tail, (xcfg.index_kpool, 2 * xcfg.index_head_dim), "tail ring pool", layer)
+            family.append(tail)
+        return tuple(family)
+
+    def _make_kda_layer_cache(self, layer: int, entries: Sequence[Any]) -> tuple[torch.Tensor, ...]:
+        """Build one KDA layer's (conv, ssm) state tuple from the runner's single mamba entry."""
+        if len(entries) != 1:
+            raise ValueError(f"xlite: layer {layer} expected one (conv, ssm) mamba entry, got {len(entries)}")
+        conv, ssm = entries[0]
+        return self._validate_kda_pool(conv, ssm, layer)
 
 
 class MiniMaxM2XliteModel(StandardXliteModel):
