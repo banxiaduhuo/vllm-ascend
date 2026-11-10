@@ -51,6 +51,7 @@ from xlite._C import (
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.rotary_embedding import AscendRotaryEmbedding
+from vllm_ascend.xlite.recurrent_metadata import RecurrentStateMetadataConverter
 from vllm_ascend.xlite.utils import (
     _DUMMY_TENSOR,
     WeightGetterConfig,
@@ -137,6 +138,14 @@ class XliteModelBase(ABC):
     model: e.g., in `Glm4MoeForCausalLM`, the MLP modules need to be accessed via `.model.layers[i].mlp`, thus `mlp`."""
     _requires_v2_model_runner: bool = False
     """Adapters that only run under the V2 model runner; `XliteWrapper` refuses V1 for them."""
+
+    def _recurrent_meta_converter(self) -> RecurrentStateMetadataConverter:
+        if not hasattr(self, "_recurrent_converter"):
+            cfg = self.xlite_config
+            self._recurrent_converter = RecurrentStateMetadataConverter(
+                cfg.max_batch_size, cfg.max_m, cfg.linear_conv_kernel_dim
+            )
+        return self._recurrent_converter
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Automatically register subclasses in the architecture strategy map."""
@@ -935,7 +944,7 @@ class HybridXliteBase(XliteModelBase):
         kv_cache_groups: Sequence[Any],
         is_dummy: bool,
     ) -> None:
-        """Append the extra family block tables to the main-KV slot, verbatim."""
+        """Resolve recurrent family tables and retain the optional kpool tail."""
         tables = []
         for group in self._extra_attn_groups(kv_cache_groups):
             tables.append(
@@ -945,6 +954,48 @@ class HybridXliteBase(XliteModelBase):
             )
         # Rebuild from the common main-KV slot so repeated dummy runs stay idempotent.
         meta.block_tables = [*meta.block_tables[:1], *tables]
+        if is_dummy:
+            n_mamba = sum(self._is_mamba_group(g) for g in self._extra_attn_groups(kv_cache_groups))
+            meta.ssm_read_indices = [torch.zeros(1, dtype=torch.int32, device=self.device) for _ in range(n_mamba)]
+            meta.ssm_write_indices = [torch.zeros(1, dtype=torch.int32, device=self.device) for _ in range(n_mamba)]
+            meta.conv_read_locations = [
+                torch.zeros((1, 3), dtype=torch.int32, device=self.device) for _ in range(n_mamba)
+            ]
+            return
+        self._augment_recurrent_spec(meta, by_group, kv_cache_groups)
+
+    def _augment_recurrent_spec(self, meta, by_group, kv_cache_groups) -> None:
+        from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+        raw = getattr(self, "_forward_attn_metadata", None) or {}
+        layers = {}
+        for name, value in raw.items():
+            match = re.search(r"layers\.(\d+)\.", name)
+            if match and isinstance(value, GDNAttentionMetadata):
+                layers[int(match.group(1))] = value
+        tables, of_layer = [], []
+        for layer in self.kda_layers:
+            if layer not in layers:
+                raise ValueError(f"xlite hybrid: missing recurrent metadata for layer {layer}")
+            value = layers[layer]
+            gid = next((i for i, table in enumerate(tables) if table is value), len(tables))
+            if gid == len(tables):
+                tables.append(value)
+            of_layer.append(gid)
+        n_mamba = sum(self._is_mamba_group(g) for g in self._extra_attn_groups(kv_cache_groups))
+        if len(tables) != n_mamba or not tables or of_layer != [p % len(tables) for p in range(len(of_layer))]:
+            raise ValueError("xlite hybrid: recurrent groups must follow linear-layer round robin")
+        main = self.select_main_common_group(by_group, kv_cache_groups)
+        num_reqs = len(meta.lens_cpu)
+        reads, writes, conv = self._recurrent_meta_converter().convert(
+            tables, meta.query_start_loc, num_reqs, main.num_actual_tokens
+        )
+        resolved = [t[:num_reqs].reshape(-1, 1).to(torch.int32) for t in reads]
+        # Keep the optional kpool tail table after the recurrent family slots.
+        meta.block_tables = [meta.block_tables[0], *resolved, *meta.block_tables[1 + len(resolved):]]
+        meta.ssm_read_indices = reads
+        meta.ssm_write_indices = writes
+        meta.conv_read_locations = conv
 
     # ---- structured KV cache ---------------------------------------------------------------
 
@@ -1571,7 +1622,7 @@ class Glm5NextXliteModel(HybridXliteBase, DeepseekV32XliteModel):
         """Build one sparse-MLA layer's family tuple: (main latent k, optional pe plane, indexer kpool, tail ring).
 
         The tail entry is the runner's paged tail-ring pool, passed through as the
-        ``[blocks, index_kpool, 2*index_head_dim]`` fp32 view (each row is one pool
+        ``[blocks, ring_rows >= index_kpool, 2*index_head_dim]`` fp32 view (each row is one pool
         slot's ``[k | gate]`` pair); compress/spill is its sole consumer.
         """
         xcfg = self.xlite_config
@@ -1585,7 +1636,14 @@ class Glm5NextXliteModel(HybridXliteBase, DeepseekV32XliteModel):
         family = [k_cache, k_cache[..., :0], indexers[0]]  # NoPE: no rope plane, pe slot stays an empty view
         if tail_entries:
             (tail,) = self._cache_components(tail_entries[0])
-            tail = self._expect_cache_shape(tail, (xcfg.index_kpool, 2 * xcfg.index_head_dim), "tail ring pool", layer)
+            if (
+                tail.dim() != 3
+                or tail.shape[0] == 0
+                or tail.shape[1] < xcfg.index_kpool
+                or tail.shape[2] != 2 * xcfg.index_head_dim
+                or tail.dtype != torch.float32
+            ):
+                raise ValueError(f"xlite: layer {layer} invalid tail ring pool {tuple(tail.shape)}")
             family.append(tail)
         return tuple(family)
 
@@ -1776,6 +1834,7 @@ class XliteWrapper:
             XliteForwardResult: Forward outputs from xlite graph or the original runnable implementation.
         """
         forward_context = get_forward_context()
+        self.adapter_xlite_model._forward_attn_metadata = forward_context.attn_metadata
         common = self.adapter_xlite_model._common_attn_metadata()
         # Route by token count, max across DP ranks (graph modes hold the bucket-padded count — safe:
         # xlite only requires DP-uniform output rows never smaller than the rank's own token count).

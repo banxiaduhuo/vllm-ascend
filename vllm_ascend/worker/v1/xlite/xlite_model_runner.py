@@ -85,8 +85,9 @@ class XliteModelRunner(XliteModelRunnerMixin, NPUModelRunner):  # type: ignore[m
         self, kv_cache_config: KVCacheConfig, kv_cache_allocation_context: AbstractContextManager | None = None
     ) -> None:
         super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context=kv_cache_allocation_context)
-        kv_caches: list[torch.Tensor] = self._get_flattened_kv_caches(self.kv_caches)
+        kv_caches: list[torch.Tensor] = self._get_flattened_kv_caches(self.kv_caches, check_is_contiguous=False)
         logger.info_once("xlite: registering kv caches to runner model: %s", _TensorRepr(kv_caches, max_it=None))
+        self.runner_model.adapter_xlite_model.kv_cache_config = kv_cache_config
         self.runner_model.register_kv_caches(kv_caches)
 
     def _should_build_dummy_attn_metadata(
