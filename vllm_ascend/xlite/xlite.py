@@ -1557,11 +1557,13 @@ class Glm5NextXliteModel(HybridXliteBase, DeepseekV32XliteModel):
         """kpool indexer weights (MLA layers), cast to fp32 as native does after loading."""
         xlite_model = self.xlite_model
         idx_hd = self.hf_text_config.index_head_dim
-        self.init_matmul_weights(layers, "index_q_b", "self_attn.indexer.wq_b", mask=mla_mask, row_processor=_to_fp32)
-        # wk_weights_proj is fused [idx_hd, hidden] wk + [n_head, hidden] weights_proj; keep [N, K].
+        self.init_matmul_weights(layers, "index_q_b", "self_attn.indexer.wq_b", mask=mla_mask)
+        # wk_weights_proj is fused [wk (idx_hd rows); weights_proj] — extract once, split per slot.
         wk_proj = get_layer_weights(layers, "self_attn.indexer.wk_weights_proj.weight", mask=mla_mask)
         xlite_model.index_wk = [_to_fp32(w[:idx_hd, :].contiguous() if w.ndim >= 2 else w) for w in wk_proj]
-        xlite_model.index_weights_proj = [_to_fp32(w[idx_hd:, :].contiguous() if w.ndim >= 2 else w) for w in wk_proj]
+        xlite_model.index_weights_proj = [
+            _to_fp32(w[idx_hd:, :].t().contiguous() if w.ndim >= 2 else w) for w in wk_proj
+        ]
         # native validates the APE as fp32 [kpool, head_dim]; all indexer params cast to fp32.
         self._bind_plain_slots(
             layers,
