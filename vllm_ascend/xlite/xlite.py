@@ -1045,6 +1045,7 @@ class HybridXliteBase(XliteModelBase):
         hybrid states. The V1 flat list cannot express hybrid ownership — this adapter is V2-only.
         """
         by_layer = _kv_cache_by_layer(kv_caches)
+        layers, _ = self._get_layers_and_model_prefix()
         result: list[tuple[torch.Tensor, ...]] = []
         for layer in range(self.xlite_config.n_layers):
             entries = by_layer.get(layer, [])
@@ -1053,6 +1054,11 @@ class HybridXliteBase(XliteModelBase):
             if layer in self.full_attn_layers:
                 result.append(self._make_full_layer_cache(layer, entries))
             else:
+                # A layer index alone can also match a second registered owner.
+                # The module prefix is the exact static-forward-context cache key.
+                owner = getattr(getattr(layers[layer], self._kda_attn_module), "prefix", None)
+                if owner in kv_caches:
+                    entries = [kv_caches[owner]]
                 result.append(self._make_kda_layer_cache(layer, entries))
         logger.info_once("xlite hybrid: registered kv caches: %s", _TensorRepr(result, max_it=None))
         return result
@@ -1226,11 +1232,37 @@ class Qwen35XliteModel(HybridXliteBase, StandardXliteModel):
         return tuple(cache) if isinstance(cache, (list, tuple)) else (cache,)
 
     def _make_kda_layer_cache(self, layer: int, entries: Sequence[Any]) -> tuple[torch.Tensor, ...]:
-        """Build one GDN layer's (conv, ssm) state tuple from the runner's single mamba entry."""
-        if len(entries) != 1:
-            raise ValueError(f"xlite qwen35: layer {layer} expected one (conv, ssm) mamba entry, got {len(entries)}")
-        conv, ssm = entries[0]
-        return self._validate_kda_pool(conv, ssm, layer)
+        """Resolve paired or split GDN views by their native state descriptors.
+
+        Ownership has already been resolved from cache names in extract_kv_cache.
+        Never pick a candidate using group position: multiple distinct matching
+        pools indicate ambiguous ownership and must fail before device dispatch.
+        """
+        logger.info_once("xlite qwen35: layer %s cache entries: %s", layer, _TensorRepr(entries, max_it=None))
+        tensors: list[torch.Tensor] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, torch.Tensor):
+                tensors.append(value)
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    collect(item)
+            else:
+                raise ValueError(f"xlite qwen35: layer {layer} unsupported cache entry {type(value).__name__}")
+
+        collect(entries)
+        unique = {}
+        for tensor in tensors:
+            key = (tensor.device, tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+            unique[key] = tensor
+        convs = [tensor for tensor in unique.values() if tensor.ndim == 3]
+        ssms = [tensor for tensor in unique.values() if tensor.ndim == 4]
+        if len(unique) != 2 or len(convs) != 1 or len(ssms) != 1:
+            raise ValueError(
+                f"xlite qwen35: layer {layer} requires one unambiguous conv/ssm pair; "
+                f"got {len(entries)} entries: {_TensorRepr(entries, max_it=None)}"
+            )
+        return self._validate_kda_pool(convs[0], ssms[0], layer)
 
 
 class DeepseekV3XliteModel(Glm4MoeXliteModel):
