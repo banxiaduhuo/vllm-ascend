@@ -992,7 +992,7 @@ class HybridXliteBase(XliteModelBase):
         )
         resolved = [t[:num_reqs].reshape(-1, 1).to(torch.int32) for t in reads]
         # Keep the optional kpool tail table after the recurrent family slots.
-        meta.block_tables = [meta.block_tables[0], *resolved, *meta.block_tables[1 + len(resolved):]]
+        meta.block_tables = [meta.block_tables[0], *resolved, *meta.block_tables[1 + len(resolved) :]]
         meta.ssm_read_indices = reads
         meta.ssm_write_indices = writes
         meta.conv_read_locations = conv
@@ -1879,6 +1879,12 @@ class XliteWrapper:
             else:
                 num_tokens = common.num_actual_tokens
         if num_tokens > self.max_tokens:
+            logger.debug(
+                "xlite dispatch: native fallback, tokens=%d, xlite_budget=%d, full_mode=%s",
+                num_tokens,
+                self.max_tokens,
+                self.full_mode,
+            )
             if self.full_mode:
                 logger.warning_once(
                     "xlite: token number exceeded expected limit (%d >%d), consider opening an issue at %s",
@@ -1887,6 +1893,13 @@ class XliteWrapper:
                     "https://atomgit.com/openeuler/GVirt",
                 )
             return self.npu_runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
+
+        logger.debug(
+            "xlite dispatch: xlite execution, tokens=%d, xlite_budget=%d, full_mode=%s",
+            num_tokens,
+            self.max_tokens,
+            self.full_mode,
+        )
 
         # `input_ids` / `inputs_embeds` length = padded token count = the output rows consumers expect.
         if input_ids is not None:
