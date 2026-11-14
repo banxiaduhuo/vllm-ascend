@@ -5,6 +5,7 @@
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 from vllm_ascend.xlite.recurrent_metadata import RecurrentStateMetadataConverter
 
@@ -49,3 +50,13 @@ def test_all_spec_null_pages_and_acceptance_offset():
         assert reads[group].tolist() == [0, 5]
         assert writes[group].tolist() == [0, 0, 4, 5]
         assert conv[group].tolist() == [[0, 0, 4], [4, 1, 4]]
+
+
+def test_recurrent_group_count_cannot_change_after_capture():
+    meta = SimpleNamespace(spec_state_indices_tensor=None, non_spec_state_indices_tensor=tensor([1]))
+    converter = RecurrentStateMetadataConverter(2, 4, 4)
+    reads, _, _ = converter.convert([meta], tensor([0, 1]), 1, 1)
+    address = reads[0].data_ptr()
+    with pytest.raises(ValueError, match="group count changed"):
+        converter.convert([meta, meta], tensor([0, 1]), 1, 1)
+    assert reads[0].data_ptr() == address
