@@ -22,6 +22,7 @@ class RecurrentStateMetadataConverter:
         self._reads: list[torch.Tensor] = []
         self._writes: list[torch.Tensor] = []
         self._conv: list[torch.Tensor] = []
+        self._num_groups: int | None = None
 
     def _allocate(self, num_groups: int, device: torch.device) -> None:
         self._reads = [
@@ -35,10 +36,15 @@ class RecurrentStateMetadataConverter:
         ]
 
     def convert(self, groups: list[Any], qsl: torch.Tensor, num_reqs: int, num_actual_tokens: int):
-        if num_reqs > self._max_batch_size or num_actual_tokens > self._max_tokens:
+        if not 0 <= num_reqs <= self._max_batch_size or not 0 <= num_actual_tokens <= self._max_tokens:
             raise ValueError("xlite recurrent metadata exceeds configured capacity")
-        if len(groups) != len(self._reads):
+        if self._num_groups is None:
             self._allocate(len(groups), qsl.device)
+            self._num_groups = len(groups)
+        elif len(groups) != self._num_groups:
+            raise ValueError("xlite recurrent metadata group count changed after buffer allocation")
+        elif self._reads and self._reads[0].device != qsl.device:
+            raise ValueError("xlite recurrent metadata device changed after buffer allocation")
         for gid, meta in enumerate(groups):
             self._fill_group(gid, meta, qsl, num_reqs, num_actual_tokens)
         return self._reads, self._writes, self._conv
