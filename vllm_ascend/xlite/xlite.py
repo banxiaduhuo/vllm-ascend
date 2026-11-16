@@ -72,9 +72,23 @@ if TYPE_CHECKING:
 XliteForwardResult: TypeAlias = torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]
 
 
+def _ensure_nd(t: torch.Tensor) -> torch.Tensor:
+    """Return ``t`` in ND layout (row ops on FRACTAL_NZ tensors would corrupt data)."""
+    if torch_npu.get_npu_format(t) == torch_npu.Format.FRACTAL_NZ:  # type: ignore[attr-defined]
+        return torch_npu.npu_format_cast(t, torch_npu.Format.ND)  # type: ignore[attr-defined]
+    return t
+
+
 def _to_fp32(t: torch.Tensor) -> torch.Tensor:
     """Cast a weight/bias tensor to fp32 (GLM5 indexer / MHC params are fp32-native)."""
-    return t.to(torch.float32)
+    return _ensure_nd(t).to(torch.float32)
+
+
+def _require_config_attr(config: Any, name: str, arch: str) -> Any:
+    """Read a required HF config attr with a clear error instead of a bare AttributeError."""
+    if not hasattr(config, name):
+        raise ValueError(f"xlite {arch}: hf config is missing required attribute '{name}'")
+    return getattr(config, name)
 
 
 def _slice_rows(start: int, length: int) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -83,7 +97,7 @@ def _slice_rows(start: int, length: int) -> Callable[[torch.Tensor], torch.Tenso
     def apply(w: torch.Tensor) -> torch.Tensor:
         if w.ndim == 0 or w.numel() == 0:
             return w
-        return w[start : start + length].contiguous()
+        return _ensure_nd(w)[start : start + length].contiguous()
 
     return apply
 
@@ -312,7 +326,7 @@ class XliteModelBase(ABC):
 
     @staticmethod
     def all_tensors_zero(tensors: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...] | None) -> bool:
-        """Check if all tensors in the list/tuple are zero tensors.
+        """Check if all tensors in the list/tuple are zero tensors (dummies ignored).
 
         Args:
             tensors (torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...] | None): The tensors to check.
@@ -324,6 +338,7 @@ class XliteModelBase(ABC):
             return True
         if not isinstance(tensors, (list, tuple)):
             tensors = [tensors]
+        tensors = [t for t in tensors if not is_dummy_tensor(t)]
         if len(tensors) == 0:
             return True
         return all(torch.allclose(t, t.new_zeros(1)) for t in tensors)
@@ -413,7 +428,13 @@ class XliteModelBase(ABC):
         """
         if (select := getattr(self, "select_main_common_group", None)) is not None:
             return select(self._common_attn_metadata_by_group(), self._kv_cache_groups())
-        return self._common_attn_metadata_by_group()[0]
+        by_group = self._common_attn_metadata_by_group()
+        if not by_group:
+            raise ValueError(
+                "xlite: no per-group common attention metadata retained by the runner "
+                "(_decoder_replay_common_metadata is empty; decoder replay init has not run)"
+            )
+        return by_group[0]
 
     def _common_attn_metadata_by_group(self) -> dict[int, AscendCommonAttentionMetadata]:
         """Return the per-group common attention metadata retained by the runner.
@@ -689,19 +710,22 @@ class StandardXliteModel(XliteModelBase):
         xlite_model, xlite_config = self.xlite_model, self.xlite_config
         self.init_matmul_weights(layers, "mha_qkv", "self_attn.qkv_proj", mask=mask, row_processor=qkv_row_processor)
         self.init_matmul_weights(layers, "attn_out", "self_attn.o_proj", mask=mask)
-        with xlite_model.condition(lambda tensors: len(tensors) == xlite_config.n_layers):
+        # With a mask, list length no longer means "exists" — probe for real tensors.
+        with xlite_model.condition(lambda tensors: any(not is_dummy_tensor(t) for t in tensors)):
             xlite_model.mha_q_norm = get_layer_weights(
                 layers, "self_attn.q_norm.weight", mask=mask, post_processor=norm_post
             )
             xlite_model.mha_k_norm = get_layer_weights(
                 layers, "self_attn.k_norm.weight", mask=mask, post_processor=norm_post
             )
-            xlite_config.qk_norm = bool(xlite_model.mha_q_norm) and bool(xlite_model.mha_k_norm)
+            xlite_config.qk_norm = any(not is_dummy_tensor(t) for t in xlite_model.mha_q_norm) and any(
+                not is_dummy_tensor(t) for t in xlite_model.mha_k_norm
+            )
         with xlite_model.condition(lambda tensors: not self.all_tensors_zero(tensors)):
             xlite_model.mha_qkv_bias = get_layer_weights(
                 layers, "self_attn.qkv_proj.bias", mask=mask, post_processor=qkv_row_processor
             )
-            xlite_config.qkv_bias = len(xlite_model.mha_qkv_bias) == xlite_config.n_layers
+            xlite_config.qkv_bias = any(not is_dummy_tensor(t) for t in xlite_model.mha_qkv_bias)
             if xlite_config.qk_norm:
                 xlite_model.mha_q_norm_bias = get_layer_weights(layers, "self_attn.q_norm.bias", mask=mask)
                 xlite_model.mha_k_norm_bias = get_layer_weights(layers, "self_attn.k_norm.bias", mask=mask)
@@ -851,7 +875,8 @@ class HybridXliteBase(XliteModelBase):
         if all(t is not None for t in module_types):
             types: Sequence[Any] = module_types
         else:
-            types = list(getattr(self.hf_text_config, "layer_types", []) or [])
+            # HF layer_types may carry extra MTP-tail entries; drop them.
+            types = list(getattr(self.hf_text_config, "layer_types", []) or [])[: len(layers)]
             types += ["full_attention"] * (len(layers) - len(types))
         return [i for i, t in enumerate(types) if t == self._kda_layer_type]
 
@@ -912,7 +937,13 @@ class HybridXliteBase(XliteModelBase):
 
     def select_main_common_group(self, by_group: dict[int, Any], kv_cache_groups: Sequence[Any]) -> Any:
         """Pick the main full-attention group's common metadata (group 0 may be a KDA group)."""
-        return by_group[self._group_id(kv_cache_groups, self._main_attn_group(kv_cache_groups))]
+        gid = self._group_id(kv_cache_groups, self._main_attn_group(kv_cache_groups))
+        if gid not in by_group:
+            raise ValueError(
+                f"xlite hybrid: main group {gid} has no common attention metadata "
+                f"(registered groups: {sorted(by_group)}; decoder replay init may not have run)"
+            )
+        return by_group[gid]
 
     def augment_attn_meta(
         self,
@@ -924,11 +955,16 @@ class HybridXliteBase(XliteModelBase):
         """Append the extra family block tables to the main-KV slot, verbatim."""
         tables = []
         for group in self._extra_attn_groups(kv_cache_groups):
-            tables.append(
-                torch.zeros((1, 1), dtype=torch.int32, device=self.device)
-                if is_dummy
-                else by_group[self._group_id(kv_cache_groups, group)].block_table_tensor
-            )
+            if is_dummy:
+                tables.append(torch.zeros((1, 1), dtype=torch.int32, device=self.device))
+                continue
+            gid = self._group_id(kv_cache_groups, group)
+            if gid not in by_group:
+                raise ValueError(
+                    f"xlite hybrid: extra group {gid} has no common attention metadata "
+                    f"(registered groups: {sorted(by_group)}; group registration order may have changed)"
+                )
+            tables.append(by_group[gid].block_table_tensor)
         # Rebuild from the common main-KV slot so repeated dummy runs stay idempotent.
         meta.block_tables = [*meta.block_tables[:1], *tables]
 
@@ -958,15 +994,24 @@ class HybridXliteBase(XliteModelBase):
 
         The native layer (patched into Qwen3.5's GDN, native in GLM5's KDA) is the sole shape and
         dtype authority; its declared shapes already include the speculative lookahead (`num_spec`).
+        GLM5's RecoverSSM keeps its correction/record buffers inside the layer (not in the KV
+        cache), so the cache contract is exactly 2 states.
         """
         layers, _ = self._get_layers_and_model_prefix()
         attn = getattr(layers[layer], self._kda_attn_module)
-        conv_shape, ssm_shape = attn.get_state_shape()[:2]
+        state_shapes = attn.get_state_shape()
+        if len(state_shapes) != 2:
+            raise ValueError(
+                f"xlite hybrid: layer {layer} native KDA declares {len(state_shapes)} states "
+                "(expected 2; RecoverSSM records must stay out of the KV cache)"
+            )
+        conv_shape, ssm_shape = state_shapes
         conv = self._expect_cache_shape(conv, tuple(conv_shape), "conv pool", layer)
         ssm = self._expect_cache_shape(ssm, tuple(ssm_shape), "ssm pool", layer)
         if conv.shape[0] != ssm.shape[0] or conv.shape[0] == 0:
             raise ValueError(f"xlite hybrid: layer {layer} conv/ssm slot counts differ or are empty")
-        conv_dtype, ssm_dtype = attn.get_state_dtype()[:2]
+        state_dtypes = attn.get_state_dtype()
+        conv_dtype, ssm_dtype = state_dtypes[0], state_dtypes[1]
         if conv.dtype != conv_dtype:
             raise ValueError(f"xlite hybrid: layer {layer} conv pool must be {conv_dtype}, got {conv.dtype}")
         if ssm.dtype != ssm_dtype:
@@ -1090,6 +1135,7 @@ class Qwen35XliteModel(HybridXliteBase, StandardXliteModel):
             """Repack ``[q|gate interleaved, k, v]`` rows; also used for 1-D quant side tensors."""
             if w.numel() == 0 or not xlite_config.attn_output_gate:
                 return w  # native [Q|K|V] is already the C++ layout.
+            w = _ensure_nd(w)  # split/reshape/cat need the ND row-major view
             rows = w.shape[0]
             # Derive the local q rows from the tensor itself so a global/local q_size mismatch
             # cannot silently skip the repack.
@@ -1352,9 +1398,14 @@ class Glm5NextXliteModel(HybridXliteBase, DeepseekV32XliteModel):
         xlite_config.softmax_scale = (hf_config.qk_nope_head_dim + hf_config.qk_rope_head_dim) ** -0.5
 
         # MHC residual mixing (hc_mult / hc_sinkhorn_iters, same names as in config.json).
-        xlite_config.hc_mult = hf_config.hc_mult
-        xlite_config.hc_sinkhorn_iters = hf_config.hc_sinkhorn_iters
-        xlite_config.hc_eps = hf_config.hc_eps
+        # Required attrs: fail fast with a clear message instead of a bare AttributeError.
+        xlite_config.hc_mult = int(_require_config_attr(hf_config, "hc_mult", "glm5next"))
+        if xlite_config.hc_mult < 1:
+            raise ValueError(f"xlite glm5next: hc_mult must be >= 1, got {xlite_config.hc_mult}")
+        xlite_config.hc_sinkhorn_iters = int(_require_config_attr(hf_config, "hc_sinkhorn_iters", "glm5next"))
+        xlite_config.hc_eps = float(_require_config_attr(hf_config, "hc_eps", "glm5next"))
+        if not (0.0 < xlite_config.hc_eps < 1.0):
+            raise ValueError(f"xlite glm5next: hc_eps must be in (0, 1), got {xlite_config.hc_eps}")
 
         # KDA linear-attention dims (q/k/v share the same head layout).
         xlite_config.linear_num_k_heads = hf_config.linear_num_heads
@@ -1366,7 +1417,9 @@ class Glm5NextXliteModel(HybridXliteBase, DeepseekV32XliteModel):
         xlite_config.gate_lower_bound = float(hf_config.linear_lower_bound)
 
         # kpool indexer (sparse MLA layers): kpool>1 enables the compress+spill path.
-        compress_ratio = int(hf_config.index_kpool)
+        compress_ratio = int(_require_config_attr(hf_config, "index_kpool", "glm5next"))
+        if compress_ratio < 1:
+            raise ValueError(f"xlite glm5next: index_kpool must be >= 1, got {compress_ratio}")
         xlite_config.index_kpool = compress_ratio
         xlite_config.index_kpool_compress = compress_ratio > 1
         xlite_config.index_head_dim = hf_config.index_head_dim
@@ -1388,6 +1441,11 @@ class Glm5NextXliteModel(HybridXliteBase, DeepseekV32XliteModel):
         from vllm_ascend.models.glm5next.kv_cache import get_kpool_tail_ring_capacity
 
         main_block = self._pin_cache_geometry([AscendSFABackend])
+        if main_block % compress_ratio != 0:
+            # Same invariant as the C++ side op.cpp kpool ops.
+            raise ValueError(
+                f"xlite glm5next: block_size {main_block} is not divisible by index_kpool {compress_ratio}"
+            )
         xlite_config.block_sizes = [
             main_block,
             main_block // compress_ratio,
@@ -1495,8 +1553,10 @@ class Glm5NextXliteModel(HybridXliteBase, DeepseekV32XliteModel):
         self.init_matmul_weights(layers, "index_q_b", "self_attn.indexer.wq_b", mask=mla_mask, row_processor=_to_fp32)
         # wk_weights_proj is fused [idx_hd, hidden] wk + [n_head, hidden] weights_proj; keep [N, K].
         wk_proj = get_layer_weights(layers, "self_attn.indexer.wk_weights_proj.weight", mask=mla_mask)
-        xlite_model.index_wk = [_to_fp32(w[:idx_hd, :].contiguous() if w.ndim >= 2 else w) for w in wk_proj]
-        xlite_model.index_weights_proj = [_to_fp32(w[idx_hd:, :].contiguous() if w.ndim >= 2 else w) for w in wk_proj]
+        xlite_model.index_wk = [_to_fp32(_ensure_nd(w)[:idx_hd, :].contiguous() if w.ndim >= 2 else w) for w in wk_proj]
+        xlite_model.index_weights_proj = [
+            _to_fp32(_ensure_nd(w)[idx_hd:, :].contiguous() if w.ndim >= 2 else w) for w in wk_proj
+        ]
         # native validates the APE as fp32 [kpool, head_dim]; all indexer params cast to fp32.
         self._bind_plain_slots(
             layers,
@@ -1557,8 +1617,8 @@ class Glm5NextXliteModel(HybridXliteBase, DeepseekV32XliteModel):
         """Build one sparse-MLA layer's family tuple: (main latent k, optional pe plane, indexer kpool, tail ring).
 
         The tail entry is the runner's paged tail-ring pool, passed through as the
-        ``[blocks, index_kpool, 2*index_head_dim]`` fp32 view (each row is one pool
-        slot's ``[k | gate]`` pair); compress/spill is its sole consumer.
+        ``[blocks, >= index_kpool, 2*index_head_dim]`` fp32 view (each row is one
+        pool slot's ``[k | gate]`` pair); compress/spill is its sole consumer.
         """
         xcfg = self.xlite_config
         main, indexer_entry, *tail_entries = entries
@@ -1571,7 +1631,11 @@ class Glm5NextXliteModel(HybridXliteBase, DeepseekV32XliteModel):
         family = [k_cache, k_cache[..., :0], indexers[0]]  # NoPE: no rope plane, pe slot stays an empty view
         if tail_entries:
             (tail,) = self._cache_components(tail_entries[0])
-            tail = self._expect_cache_shape(tail, (xcfg.index_kpool, 2 * xcfg.index_head_dim), "tail ring pool", layer)
+            if tail.dim() != 3 or tail.shape[1] < xcfg.index_kpool or tail.shape[2] != 2 * xcfg.index_head_dim:
+                raise ValueError(
+                    f"xlite: layer {layer} tail ring pool {tuple(tail.shape)} does not match "
+                    f"[blocks, >= {xcfg.index_kpool}, {2 * xcfg.index_head_dim}]"
+                )
             family.append(tail)
         return tuple(family)
 
